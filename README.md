@@ -37,3 +37,10 @@ cd -
 ```bash
 pip install -r requirements.txt
 ```
+
+## Download model
+### Files for gpt-oss reference torch implementation
+```bash
+pip install -y huggingface_hub  # to use `hf` command
+hf download openai/gpt-oss-20b --include "original/*" --local-dir gpt-oss-20b/
+```
