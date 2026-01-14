@@ -1,0 +1,855 @@
+import dataclasses
+from typing import Any, Dict, Union, Optional, Tuple, List, Literal
+from math import sqrt, log, pi
+from functools import partial
+
+
+from tvm import te, tir, relax
+from tvm.script import tir as T
+from tvm.relax.frontend import nn
+from tvm.relax.frontend.nn import Tensor, op
+
+from mlc_llm import op as op_ext
+import mlc_llm.compiler_pass  # noqa: F401
+from mlc_llm.nn import PagedKVCache, RopeMode
+from mlc_llm.support import logging
+from mlc_llm.support.config import ConfigBase
+from mlc_llm.support.style import bold
+
+
+logger = logging.getLogger(__name__)
+
+
+def yarn_find_correction_dim(
+    num_rotations: int,
+    d: tir.Var,
+    theta: float,
+    max_position_embeddings: int,
+):
+    """Inverse dim formula to find dim based on number of rotations"""
+    return (
+            (d * log(max_position_embeddings / (num_rotations * 2 * pi)))
+            / (2 * log(theta))
+    )
+
+
+def yarn_find_correction_range(
+    low_rot: int,
+    high_rot: int,
+    d: tir.Var,
+    theta: float,
+    max_position_embeddings: int,
+):
+    """Find the correction range based on the number of rotations"""
+    low = yarn_find_correction_dim(low_rot, d, theta, max_position_embeddings)
+    high = yarn_find_correction_dim(high_rot, d, theta, max_position_embeddings)
+
+    return tir.max(low, 0), tir.min(high, d - 1)
+
+
+def rope_freq_yarn(
+    s: tir.Var,
+    d: tir.Var,
+    d_range: int,
+    theta: float,
+    dtype: str,
+    original_max_position_embeddings: int,
+    scaling_factor: float,
+    beta_fast: int,
+    beta_slow: int,
+):  # pylint: disable=too-many-arguments, too-many-locals
+    """Compute the inverse frequency of RoPE for yarn RoPE scaling."""
+
+    exponent = d * 2 % d_range / tir.const(d_range, "float32")
+    freq_power = tir.power(theta, exponent)
+
+    freq_extra = tir.const(1, "float32") / freq_power
+    freq_inter = tir.const(1, "float32") / (scaling_factor * freq_power)
+
+    low, high = yarn_find_correction_range(
+        beta_fast, beta_slow, d_range, theta, original_max_position_embeddings
+    )
+    high = tir.if_then_else(low == high, high + 0.001, high)
+    inv_freq_mask = tir.const(1, "float32") - tir.max(
+        tir.min((d - low) / (high - low), 1.0), 0.0
+    ).astype("float32")
+    inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+    freq = s * inv_freq
+    freq_var = tir.Var("freq", "float32")
+    cos_freq = tir.cos(freq_var).astype(dtype)
+    sin_freq = tir.sin(freq_var).astype(dtype)
+
+    return cos_freq, sin_freq, {freq_var: freq}
+
+
+# fixed structure for mlc-llm style
+@dataclasses.dataclass
+class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
+    """Configuration of the gpt-oss model."""
+
+    # only in Qwen3 (of MLC-LLM)
+    # hidden_act: str
+    # attention_bias: bool
+    # rms_norm_eps: float
+    context_window_size: int = 40960
+    prefill_chunk_size: int = 0
+    # tie_word_embeddings: bool = False
+    tensor_parallel_shards: int = 1
+    pipeline_parallel_stages: int = 1
+    dtype: str = "bfloat16"
+    # max_batch_size: int = 1
+    # weight_block_size: Optional[Tuple[int, int]] = None
+    kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    # Qwen3-MoE
+    # moe_intermediate_size: int = 0
+    # decoder_sparse_step: int = 0
+    # norm_topk_prob: bool = False
+
+    # common arguments: use MLC-LLM argument name
+    num_hidden_layers: int = 36
+    num_experts: int = 128
+    num_experts_per_tok: int = 4  # in gpt-oss, `experts_per_token`
+    vocab_size: int = 201088
+    hidden_size: int = 2880
+    intermediate_size: int = 2880
+    head_dim: int = 64
+    num_attention_heads: int = 64
+    num_key_value_heads: int = 8
+    sliding_window_size: int = 128
+    rope_theta: Union[int, float] = 150000
+    rope_scaling: Optional[Dict] = None
+
+    # only in gpt-oss
+    swiglu_limit: float = 7.0
+    # initial_context_length: int = 4096
+    # rope_scaling_factor: float = 32.0
+    # rope_ntk_alpha: float = 1.0
+    # rope_ntk_beta: float = 32.0
+
+    # to use alternating dense-sliding Attention
+    sliding_window_pattern: int = 2
+
+    def __post_init__(self):
+        if self.rope_scaling is None:
+            self.rope_scaling = {
+                # "rope_type": "yarn",
+                "rope_theta": float(self.rope_theta),
+                "factor": 32.0,   # in gpt-oss, `rope_scaling_factor`
+                "beta_fast": 32.0,  # in gpt-oss, `rope_ntk_beta`
+                "beta_slow": 1.0,  # in gpt-oss, `rope_ntk_alpha`
+                "truncate": False,
+                "original_max_position_embeddings": 4096,  # in gpt-oss, `initial_context_length`?
+            }
+
+        if "quantization_config" in self.kwargs:
+            quantization_config = self.kwargs.get("quantization_config")
+            # FIXME(if needed)
+            pass
+
+        # context_window_size = 40960, fixed
+        if self.context_window_size == 0:
+            for name in ["max_position_embeddings", "max_sequence_length"]:
+                if name in self.kwargs:
+                    self.context_window_size = self.kwargs.pop(name)
+                    logger.info(
+                        "%s not found in config.json. Falling back to %s (%d)",
+                        bold("context_window_size"),
+                        bold(name),
+                        self.context_window_size,
+                    )
+                    break
+            else:
+                raise ValueError(
+                    "Unable to determine the maximum sequence length, because none of "
+                    "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
+                    "provided in `config.json`."
+                )
+        if self.num_key_value_heads == 0:
+            self.num_key_value_heads = self.num_attention_heads
+        if self.head_dim == 0:
+            self.head_dim = self.hidden_size // self.num_attention_heads
+        assert self.num_attention_heads % self.num_key_value_heads == 0
+        if self.prefill_chunk_size == 0:
+            logger.info(
+                "%s defaults to %d",
+                bold("prefill_chunk_size"),
+                min(
+                    self.context_window_size, 8192
+                ),  # TODO: min(context_window_size, 8192)?
+            )
+            self.prefill_chunk_size = min(
+                self.context_window_size, 8192
+            )  # TODO: min(context_window_size, 8192)?
+        elif self.prefill_chunk_size > self.context_window_size:
+            logger.info(
+                "Overriding %s from %d to %d",
+                bold("prefill_chunk_size"),
+                self.prefill_chunk_size,
+                min(
+                    self.context_window_size, 8192
+                ),  # TODO: min(context_window_size, 8192)?
+            )
+            self.prefill_chunk_size = min(
+                self.context_window_size, 8192
+            )  # TODO: min(context_window_size, 8192)?
+
+
+class AttentionBlock(nn.Module):
+    def __init__(
+            self,
+            config: GPTOssConfig,
+            layer_idx: int = 0,
+            dtype: Optional[str] = None
+    ):
+        assert config
+        self.config = config
+        if dtype is None:
+            dtype = self.config.dtype  # default is "bfloat16"
+        self.dtype = dtype
+        self.head_dim = config.head_dim
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.sliding_window = config.sliding_window_size if layer_idx % 2 == 0 else 0
+
+        self.rope_theta = config.rope_theta
+
+        self.sinks = nn.Parameter((config.num_attention_heads,), dtype=dtype)
+        self.norm = nn.RMSNorm(
+            config.hidden_size, axes=-1, bias=False, dtype=dtype
+        )
+        qkv_dim = config.head_dim * (
+                config.num_attention_heads + 2 * config.num_key_value_heads
+        )
+        self.qkv = nn.Linear(config.hidden_size, qkv_dim, bias=True, dtype=dtype)
+        self.out = nn.Linear(
+            config.head_dim * config.num_attention_heads,
+            config.hidden_size,
+            bias=True,
+            dtype=dtype,
+        )
+        self.sm_scale = 1 / sqrt(config.head_dim)
+        self.layer_idx = layer_idx  # for MLC-LLM PagedKVCache
+
+    def _rope(
+            self,
+            x: te.Tensor,
+            positions: te.Tensor,
+            rotary_dim: int,
+            theta: Union[float, tir.Var],
+            rope_scaling: Optional[Dict[str, Any]] = None,
+    ):
+        x_dtype = x.dtype
+        if rope_scaling is None:
+            rope_scaling = {
+                # "rope_type": "yarn",
+                "rope_theta": float(self.rope_theta),
+                "factor": 32.0,   # in gpt-oss, `rope_scaling_factor`
+                "beta_fast": 32.0,  # in gpt-oss, `rope_ntk_beta`
+                "beta_slow": 1.0,  # in gpt-oss, `rope_ntk_alpha`
+                "truncate": False,
+                "original_max_position_embeddings": 4096,  # in gpt-oss, `initial_context_length`?
+            }
+
+        if isinstance(theta, tir.Var):
+            theta = rope_scaling.get("rope_theta", self.rope_theta)
+
+        yarn_ftn = partial(
+            rope_freq_yarn,
+            original_max_position_embeddings=rope_scaling["original_max_position_embeddings"],
+            scaling_factor=rope_scaling["factor"],
+            beta_fast=rope_scaling["beta_fast"],
+            beta_slow=rope_scaling["beta_slow"],
+        )
+
+        def _rope_compute(
+                batch_idx: tir.Var,
+                seq_idx: tir.Var,
+                head_idx: tir.Var,
+                dim_idx: tir.Var
+        ):
+            # suppose that rotary_dim % 2 == 0
+            rotary_half = rotary_dim // 2
+            freq_idx = dim_idx % rotary_half
+
+            cos_freq, sin_freq, var_map = yarn_ftn(
+                positions[seq_idx], freq_idx, rotary_dim, theta, "float32"
+            )
+
+            # dim_idx: the index in the interval [0, head_dim)
+            # z = r^(i*theta) = cos(theta) + i * sin(theta)
+            # if dim_idx is in the half left of interval,
+            # then dim_idx is assigned to real(z)
+            # else, dim_idx is assigned to imag(z)
+            is_imaginary = dim_idx >= rotary_half
+
+            # is_imaginary => we already obtained y, so need to find x (- rotary_half)
+            # not is_imaginary => we already obtained x, so need to find y (+ rotary_half)
+            partner_d = tir.if_then_else(
+                is_imaginary,
+                dim_idx - rotary_half,
+                dim_idx + rotary_half,
+            )
+
+            scale_val = rope_scaling.get("factor", 1.0)
+            if scale_val > 1.0:
+                conc_val = 0.1 * log(scale_val) + 1.0
+            else:
+                conc_val = 1.0
+
+            concentration = tir.const(conc_val, "float32")
+            cos_val = cos_freq * concentration
+            sin_val = sin_freq * concentration
+
+            val = x[batch_idx, seq_idx, head_idx, dim_idx]
+            partner_val = x[batch_idx, seq_idx, head_idx, partner_d]
+
+            out_rope = tir.if_then_else(
+                is_imaginary,
+                partner_val * sin_val + val * cos_val,  # for y, y_rotated = x * sin + y * cos
+                val * cos_val - partner_val * sin_val  # for x, x_rotated = x * cos - y * sin
+            )
+
+            for var, value in var_map.items():
+                out_rope = tir.Let(var, value, out_rope)
+
+            return out_rope.astype(x_dtype)
+
+        return te.compute(x.shape, _rope_compute, name="yarn_rope")
+
+    def apply_rotation_to_qk(
+            self,
+            q: Tensor,
+            k: Tensor,
+            positions: Tensor
+    ):
+        rope_ftn = partial(
+            self._rope,
+            rotary_dim=self.config.head_dim,
+            theta=self.rope_theta,
+        )
+        q_embed = op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
+        k_embed = op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
+
+        return q_embed, k_embed
+
+    def forward(
+            self,
+            x: Tensor,
+            paged_kv_cache: PagedKVCache,  # for MLC-LLM style
+            query_positions: Tensor
+    ):
+        d = self.head_dim
+        n_q_heads = self.num_attention_heads
+        n_kv_heads = self.num_key_value_heads
+
+        t = self.norm(x)  # PreNorm
+
+        # from `CausalLM.prefill()`,
+        # get t of shape (batch_size, num_tokens, d)
+        batch_size = 1
+        # # batch_size, num_tokens, _ = t.shape  # x: from embedding layer; batch size is 1 for test
+
+        # [1, seq_len, 2880]
+        if len(t.shape) == 3:
+            _, num_tokens, _ = t.shape  # x: from embedding layer; batch size is 1 for test
+        else:
+            # [seq_len, 2880]
+            num_tokens, _ = t.shape
+
+        qkv = self.qkv(t)  # fused qkv
+        qkv = op.reshape(
+            qkv,
+            (batch_size, num_tokens, n_q_heads + n_kv_heads + n_kv_heads, d),
+        )
+        q, k, v = op.split(
+            qkv,
+            [n_q_heads, n_q_heads + n_kv_heads],
+            axis=2
+        )
+
+        q, k = self.apply_rotation_to_qk(q, k, query_positions)
+        # `lse_qk` is always f32
+        attention, lse_qk = paged_kv_cache.self_attention(
+            self.layer_idx, q, k, v, self.sm_scale
+        )
+
+        # since TVM use log_2 for compute LSE internally,
+        # we need to multiply log(2), natural log 2
+        # cf. L2414 in `kv_cache.py`
+        lse_qk = log(2) * lse_qk
+        sinks_f32 = op.astype(self.sinks, "float32")
+        sigmoid_scale = op.sigmoid(lse_qk - sinks_f32)
+
+        sigmoid_scale = op.unsqueeze(sigmoid_scale, dim=-1)
+        sigmoid_scale = op.astype(sigmoid_scale, self.dtype)
+
+        attention = op.multiply(attention, sigmoid_scale)
+
+        t = op.reshape(
+            attention,
+            (batch_size, num_tokens, n_q_heads * d),
+        )
+        # return t
+
+        t = self.out(t)
+        return x + t
+
+
+def swiglu(
+        x: Tensor,
+        alpha: float = 1.702,
+        limit: float = 7.0,
+        out_dtype: str = "bfloat16"
+) -> Tensor:
+    shape = x.shape
+    batch_shape = shape[:-1]
+    last_dim = shape[-1]
+    d = last_dim // 2
+
+    # reshape: (..., 2 * d) -> (..., d, 2)
+    x_reshaped = op.reshape(x, (*batch_shape, d, 2))
+
+    chunks = relax.op.split(
+        x_reshaped._expr,
+        indices_or_sections=2,
+        axis=-1
+    )
+    chunk_glu = relax.TupleGetItem(chunks, 0)
+    chunk_linear = relax.TupleGetItem(chunks, 1)
+
+    # squeeze: (..., d, 1) -> (..., d)
+    x_glu_expr = relax.op.squeeze(chunk_glu, axis=-1)
+    x_glu_expr = relax.op.astype(x_glu_expr, dtype=out_dtype)
+    x_linear_expr = relax.op.squeeze(chunk_linear, axis=-1)
+    x_linear_expr = relax.op.astype(x_linear_expr, dtype=out_dtype)
+
+    alpha = op.wrap_nested(
+        relax.const(alpha, dtype=out_dtype),
+        name="alpha_const"
+    )
+    limit_expr = relax.const(limit, dtype=out_dtype)
+
+    x_glu = op.wrap_nested(
+        relax.op.minimum(x_glu_expr, limit_expr),
+        name="x_glu_clip"
+    )
+    x_linear = op.wrap_nested(
+        relax.op.clip(x_linear_expr, min=-limit, max=limit),  # type: ignore
+        name="x_linear_clip"
+    )
+
+    gating = x_glu * op.sigmoid(alpha * x_glu)
+    output = gating * (x_linear + 1.0)
+
+    return output
+
+
+class MLPBlock(nn.Module):
+    def __init__(
+            self,
+            config: GPTOssConfig,
+            rms_norm_eps: float = 1e-5,
+            dtype: Optional[str] = None
+    ):
+        assert config
+        if dtype is None:
+            dtype = config.dtype  # default is "bfloat16"
+        self.dtype = dtype
+        self.num_experts = config.num_experts
+        self.experts_per_token = config.num_experts_per_tok
+        self.swiglu_limit = config.swiglu_limit
+        self.world_size = 1  # > 1 for the distributed training
+        self.hidden_size = config.hidden_size
+        self.norm = nn.RMSNorm(
+            config.hidden_size,
+            axes=-1,
+            epsilon=rms_norm_eps,
+            bias=False,
+            dtype=dtype,
+        )
+        self.gate = nn.Linear(
+            config.hidden_size,
+            self.num_experts,
+            dtype=dtype,
+        )
+        assert config.intermediate_size % self.world_size == 0
+        self.mlp1_weight = nn.Parameter(
+            (
+                self.num_experts,
+                config.intermediate_size * 2 // self.world_size,
+                config.hidden_size,
+            ),
+            dtype=dtype,
+        )
+        self.mlp1_bias = nn.Parameter(
+            (self.num_experts, config.intermediate_size * 2 // self.world_size),
+            dtype=dtype,
+        )
+        self.mlp2_weight = nn.Parameter(
+            (
+                self.num_experts,
+                config.hidden_size,
+                config.intermediate_size // self.world_size,
+            ),
+            dtype=dtype,
+        )
+        self.mlp2_bias = nn.Parameter(
+            (self.num_experts, config.hidden_size),
+            dtype=dtype,
+        )
+
+    @staticmethod
+    def _run_einsum(
+            input_tensor: Tensor,
+            expert_indices: Tensor,
+            weight_tensor: Tensor,
+            bias_tensor: Tensor
+    ) -> Tensor:
+        # input_dtype -> f32
+        einsum_dtype = "float32"
+        safetensor_dtype = "bfloat16"
+
+        # here, len(input_tensor.shape) is 2 or 3
+        # (seq_len, 2880); normed tensor in 1st operation
+        # (seq_len, top_k, 2880)
+
+        seq_len = input_tensor.shape[0]
+        in_features = input_tensor.shape[-1]
+        input_shape = input_tensor.shape
+        input_is_3d = len(input_shape) == 3
+
+        _, experts_per_token = expert_indices.shape  # (seq_len, 4)
+        num_all_experts, out_features, _ = weight_tensor.shape  # (32, 5760, 2880) | (32, 2880, 2880)
+
+        @T.prim_func(private=True)
+        def _einsum_matrix(
+                x_handle: T.handle,
+                e_indices: T.Buffer((seq_len, experts_per_token), "int32"),
+                weight: T.Buffer((num_all_experts, out_features, in_features), safetensor_dtype),
+                bias: T.Buffer((num_all_experts, out_features), safetensor_dtype),
+                out_handle: T.handle
+        ):
+
+            T.func_attr({"op_pattern": 4, "tir.noalias": True})
+            x = T.match_buffer(x_handle, input_shape, input_tensor.dtype)
+            out = T.match_buffer(
+                out_handle,
+                (seq_len, experts_per_token, out_features),
+                einsum_dtype
+            )
+
+            for s, r, c in T.grid(seq_len, experts_per_token, out_features):
+                # s, r, c for seq_idx, expert_rank, out_channel, resp.
+                with T.block("compute_matmul"):
+                    # S for spatial axis in the argument `kinds`
+                    seq_idx, expert_rank, out_idx = T.axis.remap("SSS", [s, r, c])
+                    # e_idx = e_indices[seq_idx, expert_rank]
+
+                    sum_buffer = T.alloc_buffer((1, ), dtype=einsum_dtype, scope="local")
+                    sum_buffer[0] = T.cast(bias[e_indices[seq_idx, expert_rank], out_idx], einsum_dtype)
+
+                    for in_idx in T.serial(in_features):
+                        if input_is_3d:
+                            sum_buffer[0] += (
+                                T.cast(x[seq_idx, expert_rank, in_idx], einsum_dtype) *
+                                T.cast(weight[e_indices[seq_idx, expert_rank], out_idx, in_idx], einsum_dtype)
+                            )
+                        else:
+                            sum_buffer[0] += (
+                                T.cast(x[seq_idx, in_idx], einsum_dtype) *
+                                T.cast(weight[e_indices[seq_idx, expert_rank], out_idx, in_idx], einsum_dtype)
+                            )
+                    out[seq_idx, expert_rank, out_idx] = sum_buffer[0]
+
+        return op.tensor_ir_op(
+            _einsum_matrix,
+            "moe_gemv_einsum",
+            args=[input_tensor, expert_indices, weight_tensor, bias_tensor],
+            out=Tensor.placeholder((seq_len, experts_per_token, out_features), einsum_dtype),
+        )
+
+    @staticmethod
+    def _run_gating(
+            input_tensor: Tensor,
+            expert_weights: Tensor,
+    ):
+        # f32 -> out_dtype
+        seq_len, experts_per_token, out_features = input_tensor.shape
+        block_dtype = "float32"
+        out_dtype = "bfloat16"
+
+        @T.prim_func(private=True)
+        def _apply_gate(
+                x_handle: T.handle,
+                e_weights: T.Buffer((seq_len, experts_per_token), "bfloat16"),
+                # e_weights: T.Buffer((seq_len, experts_per_token), "float32"),
+                out_handle: T.handle
+        ):
+            T.func_attr({"op_pattern": 4, "tir.noalias": True})
+            x = T.match_buffer(x_handle, (seq_len, experts_per_token, out_features), input_tensor.dtype)
+            out = T.match_buffer(
+                out_handle,
+                (seq_len, out_features),
+                out_dtype
+            )
+
+            for s, c in T.grid(seq_len, out_features):
+                with T.block("apply_gate"):
+                    seq_idx, out_idx = T.axis.remap("SS", [s, c])
+
+                    gate_buffer = T.alloc_buffer((1, ), dtype=block_dtype, scope="local")
+                    gate_buffer[0] = T.cast(0.0, block_dtype)
+
+                    for expert_rank in T.serial(experts_per_token):
+                        gate_buffer[0] += (
+                                T.cast(x[seq_idx, expert_rank, out_idx], block_dtype) *
+                                T.cast(e_weights[seq_idx, expert_rank], block_dtype)
+                        )
+
+                    out[seq_idx, out_idx] = T.cast(gate_buffer[0], out_dtype)
+
+
+        return op.tensor_ir_op(
+            _apply_gate,
+            "moe_gemv_gating",
+            args=[input_tensor, expert_weights],
+            out=Tensor.placeholder((seq_len, out_features), out_dtype),
+        )
+
+    def execute_moe_gemv(
+            self,
+            mode: Literal["einsum", "gating"] = "einsum",
+            *args,
+    ) -> Tensor:
+        if mode == "einsum":
+            return_ftn = self._run_einsum
+        elif mode == "gating":
+            return_ftn = self._run_gating
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        return return_ftn(*args)
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, seq_len, dim = x.shape
+        x = op.reshape(x, (b * seq_len, dim))
+
+        # t: (seq_len, 2880)
+        # g: (seq_len, 32)
+        t = self.norm(x)
+        g = self.gate(t)
+
+        # here, type: (Tensor, Tensor)
+        # top_k is 4
+        # expert_indices: (seq_len, top_k)
+        expert_weights, expert_indices = op.topk(
+            g, k=self.experts_per_token, axis=-1, largest=True
+        )
+        expert_weights = op.softmax(expert_weights, axis=1)
+
+        # MLP #1
+        # self.mlp1_weight: (32, 5760, 2880)
+        # self.mlp1_bias: (32, 5760)
+        t = self.execute_moe_gemv("einsum", t, expert_indices, self.mlp1_weight, self.mlp1_bias)  # (seq_len, top_k, 5760)
+        t = swiglu(t, limit=self.swiglu_limit, out_dtype="float32")  # (seq_len, top_k, 2880)
+
+        # MLP #2
+        # self.mlp2_weight: (32, 2880, 2880)
+        # self.mlp2_bias: (32, 2880)
+        t = self.execute_moe_gemv("einsum", t, expert_indices, self.mlp2_weight, self.mlp2_bias)
+
+        # Weighted sum of experts
+        t = self.execute_moe_gemv("gating", t, expert_weights)
+        t = op.reshape(t, x.shape)  # this resolves inconsistent buffer error
+
+        return op.reshape(x + t, (b, seq_len, dim))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+            self,
+            config: GPTOssConfig,
+            layer_idx: int,
+            dtype: Optional[str] = None
+    ):
+        assert config
+        if dtype is None:
+            dtype = config.dtype
+        self.attn = AttentionBlock(config, layer_idx, dtype=dtype)
+        self.mlp = MLPBlock(config, dtype=dtype)
+
+    def forward(
+            self,
+            x: Tensor,
+            paged_kv_cache: PagedKVCache,
+            query_positions: Tensor
+    ) -> Tensor:
+        x = self.attn(x, paged_kv_cache, query_positions)
+        x = self.mlp(x)
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(self, config: GPTOssConfig, dtype: Optional[str] = None):
+        assert config
+        if dtype is None:
+            dtype = config.dtype
+        self.embedding = nn.Embedding(
+            config.vocab_size, config.hidden_size, dtype=dtype
+        )
+        self.block = nn.ModuleList(
+            [
+                TransformerBlock(config, layer_idx, dtype=dtype)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = nn.RMSNorm(
+            config.hidden_size, -1, bias=False, dtype=dtype
+        )
+        # to use MLC-LLM style, this part is in `GPTOssForCausalLM()`
+        # self.unembedding = nn.Linear(
+        #     config.hidden_size,
+        #     config.vocab_size,
+        #     bias=False,
+        #     dtype="bfloat16",
+        # )
+
+    def forward(self, x: Tensor, paged_kv_cache: PagedKVCache) -> Tensor:
+        query_positions = paged_kv_cache.get_query_positions(x.shape[0] * x.shape[1])
+        # x = self.embedding(x)  # in embed() function
+        for block in self.block:
+            x = block(x, paged_kv_cache, query_positions)
+        # x = self.norm(x)
+
+        # to use MLC-LLM style, this part is in `GPTOssForCausalLM()`
+        # x = self.unembedding(x)
+
+        return x
+
+
+class GPTOssForCausalLM(nn.Module):
+    def __init__(self, config: GPTOssConfig):
+        self.model = Transformer(config, dtype="bfloat16")
+
+        # from config
+        self.hidden_size = config.hidden_size
+        self.num_hidden_layers = config.num_hidden_layers
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.rope_theta = config.rope_theta
+        self.rope_scaling = config.rope_scaling
+        self.dtype = config.dtype
+        # since we use a single GPU, define this arg to 1
+        self.tensor_parallel_shards = config.tensor_parallel_shards
+
+        # other setting
+        self.sw_pattern = config.sliding_window_pattern
+
+        self.unembedding = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            # dtype="bfloat16",
+            dtype="float32",
+        )
+
+    def to(self, dtype: Optional[str] = None):
+        super().to(dtype=dtype)
+        if dtype is not None:
+            self.dtype = dtype
+
+    def _get_logits(self, hidden_states: Tensor) -> Tensor:
+        logits = self.unembedding(hidden_states)
+        if logits.dtype != "float32":
+            logits = logits.astype("float32")
+        return logits
+
+    def embed(self, input_ids: Tensor) -> Tensor:
+        if self.tensor_parallel_shards > 1:
+            input_ids = op.ccl_broadcast_from_worker0(input_ids)
+        return self.model.embedding(input_ids)
+
+    def prefill(
+            self,
+            input_embed: Tensor,
+            paged_kv_cache: PagedKVCache
+    ) -> Tuple[Tensor, PagedKVCache]:
+        op_ext.configure()
+
+        seq_len = input_embed.shape[1]
+        hidden_states = self.model(input_embed, paged_kv_cache)
+        hidden_states = op.reshape(hidden_states, (1, seq_len, -1))
+        return hidden_states, paged_kv_cache
+
+    def create_paged_kv_cache(  # pylint: disable=too-many-arguments
+            self,
+            max_batch_size: tir.Var,
+            max_total_seq_len: tir.Var,
+            prefill_chunk_size: tir.Var,
+            page_size: tir.Var,
+            support_sliding_window: tir.Var,
+    ) -> PagedKVCache:
+
+        attention_layer_setting: List[Literal["mha", "mha_sliding"]] = [
+            "mha_sliding" if i % self.sw_pattern == 0 else "mha"
+            for i in range(self.num_hidden_layers)
+        ]
+
+        return PagedKVCache.create_generic(
+            attn_kind=attention_layer_setting,
+            # attn_kind="mha",
+            max_batch_size=max_batch_size,
+            max_total_seq_len=max_total_seq_len,
+            prefill_chunk_size=prefill_chunk_size,
+            page_size=page_size,
+            support_sliding_window=support_sliding_window,
+            # layer_partition=relax.ShapeExpr([0, self.num_hidden_layers]),
+            num_hidden_layers=self.num_hidden_layers,
+            num_attention_heads=self.num_attention_heads // self.tensor_parallel_shards,
+            num_key_value_heads=self.num_key_value_heads // self.tensor_parallel_shards,
+            qk_head_dim=self.head_dim,
+            v_head_dim=self.head_dim,
+            rope_mode=RopeMode.NONE,
+            rope_scale=1,
+            rope_theta=self.rope_theta,
+            rope_scaling=self.rope_scaling,
+            # rope_ext_factors=relax.PrimValue(0),
+            # rotary_dim=self.head_dim,
+            dtype=self.dtype,
+            # dtype="float32",
+            # target=target,
+            # enable_disaggregation=False,
+        )
+
+    def get_default_spec(self):
+        mod_spec = {
+            "embed": {
+                "input_ids": nn.spec.Tensor(["seq_len"], "int32"),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "prefill": {
+                "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], "bfloat16"),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "create_paged_kv_cache": {
+                "max_batch_size": int,
+                "max_total_seq_len": int,
+                "prefill_chunk_size": int,
+                "page_size": int,
+                "support_sliding_window": int,
+                "$": {
+                    "param_mode": "none",
+                    "effect_mode": "none",
+                },
+            },
+        }
+        return nn.spec.ModuleSpec.from_raw(mod_spec, self)
