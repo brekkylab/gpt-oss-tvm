@@ -44,3 +44,9 @@ pip install -r requirements.txt
 pip install -y huggingface_hub  # to use `hf` command
 hf download openai/gpt-oss-20b --include "original/*" --local-dir gpt-oss-20b/
 ```
+
+## Authors
+- @Liberatedwinner
+- @grf53
+- @jhlee525
+- @khj809
