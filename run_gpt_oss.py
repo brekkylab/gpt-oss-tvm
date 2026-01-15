@@ -15,7 +15,7 @@ def get_input_tokens():
 def main():
     SLIDING_WINDOW_SIZE = 128
 
-    model_path = Path.cwd() / "ckpt-20b" / "original"
+    model_path = Path.cwd() / "gpt-oss-20b" / "original"
 
     engine = Engine(model_path)
 
