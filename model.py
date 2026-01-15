@@ -1,7 +1,7 @@
 import dataclasses
 from functools import partial
 from math import log, pi, prod, sqrt
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 import mlc_llm.compiler_pass  # noqa: F401
 from mlc_llm import op as op_ext
@@ -80,13 +80,9 @@ def rope_freq_yarn(
     freq_extra = tir.const(1, "float32") / freq_power
     freq_inter = tir.const(1, "float32") / (scaling_factor * freq_power)
 
-    low, high = yarn_find_correction_range(
-        beta_fast, beta_slow, d_range, theta, original_max_position_embeddings
-    )
+    low, high = yarn_find_correction_range(beta_fast, beta_slow, d_range, theta, original_max_position_embeddings)
     high = tir.if_then_else(low == high, high + 0.001, high)
-    inv_freq_mask = tir.const(1, "float32") - tir.max(
-        tir.min((d - low) / (high - low), 1.0), 0.0
-    ).astype("float32")
+    inv_freq_mask = tir.const(1, "float32") - tir.max(tir.min((d - low) / (high - low), 1.0), 0.0).astype("float32")
 
     inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
     freq = s * inv_freq
@@ -241,16 +237,12 @@ class AttentionBlock(nn.Module):
             beta_slow=rope_scaling["beta_slow"],
         )
 
-        def _rope_compute(
-            batch_idx: tir.Var, seq_idx: tir.Var, head_idx: tir.Var, dim_idx: tir.Var
-        ):
+        def _rope_compute(batch_idx: tir.Var, seq_idx: tir.Var, head_idx: tir.Var, dim_idx: tir.Var):
             # suppose that rotary_dim % 2 == 0
             rotary_half = rotary_dim // 2
             freq_idx = dim_idx % rotary_half
 
-            cos_freq, sin_freq, var_map = yarn_ftn(
-                positions[seq_idx], freq_idx, rotary_dim, theta, "float32"
-            )
+            cos_freq, sin_freq, var_map = yarn_ftn(positions[seq_idx], freq_idx, rotary_dim, theta, "float32")
 
             # dim_idx: the index in the interval [0, head_dim)
             # z = r^(i*theta) = cos(theta) + i * sin(theta)
@@ -290,9 +282,7 @@ class AttentionBlock(nn.Module):
 
         return te.compute(x.shape, _rope_compute, name="yarn_rope")
 
-    def apply_rotation_to_qk(
-        self, q: Tensor, k: Tensor, positions: Tensor
-    ) -> tuple[Tensor, Tensor]:
+    def apply_rotation_to_qk(self, q: Tensor, k: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
         rope_ftn = partial(
             self._rope,
             rotary_dim=self.config.head_dim,
@@ -322,9 +312,7 @@ class AttentionBlock(nn.Module):
 
         # [1, seq_len, 2880]
         if len(t.shape) == 3:
-            _, num_tokens, _ = (
-                t.shape
-            )  # batch_size, num_tokens, _; x: from embedding layer; batch size is 1 for test
+            _, num_tokens, _ = t.shape  # batch_size, num_tokens, _; x: from embedding layer; batch size is 1 for test
         else:
             # [seq_len, 2880]
             num_tokens, _ = t.shape
@@ -343,9 +331,7 @@ class AttentionBlock(nn.Module):
         attention, lse_qk = None, None
         match forward_to:
             case "prefill":
-                attention, lse_qk = paged_kv_cache.self_attention(
-                    self.layer_idx, q=q, k=k, v=v, sm_scale=self.sm_scale
-                )
+                attention, lse_qk = paged_kv_cache.self_attention(self.layer_idx, q=q, k=k, v=v, sm_scale=self.sm_scale)
             case "decode":
                 attention, lse_qk = paged_kv_cache.cross_attention(
                     self.layer_idx, q=q, v_head_dim=d, sm_scale=self.sm_scale
@@ -376,9 +362,7 @@ class AttentionBlock(nn.Module):
         return x + t, paged_kv_cache
 
 
-def swiglu(
-    x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16"
-) -> Tensor:
+def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16") -> Tensor:
     shape = x.shape
     batch_shape = shape[:-1]
     last_dim = shape[-1]
@@ -577,9 +561,7 @@ class MLPBlock(nn.Module):
         input_is_3d = len(input_shape) == 3
 
         _, experts_per_token = expert_indices.shape  # (seq_len, 4)
-        num_all_experts, out_features, _ = (
-            weight_tensor.shape
-        )  # (32, 5760, 2880) | (32, 2880, 2880)
+        num_all_experts, out_features, _ = weight_tensor.shape  # (32, 5760, 2880) | (32, 2880, 2880)
 
         @T.prim_func(private=True)
         def _einsum_matrix(
@@ -589,13 +571,9 @@ class MLPBlock(nn.Module):
             bias: T.Buffer((num_all_experts, out_features), safetensor_dtype),
             out_handle: T.handle,
         ):
-            T.func_attr(
-                {"op_pattern": 4, "tir.noalias": True}
-            )  # pattern #4 is kOutEWiseFusable (matmul)
+            T.func_attr({"op_pattern": 4, "tir.noalias": True})  # pattern #4 is kOutEWiseFusable (matmul)
             x = T.match_buffer(x_handle, input_shape, input_tensor.dtype)
-            out = T.match_buffer(
-                out_handle, (seq_len, experts_per_token, out_features), einsum_dtype
-            )
+            out = T.match_buffer(out_handle, (seq_len, experts_per_token, out_features), einsum_dtype)
 
             for s, r, c in T.grid(seq_len, experts_per_token, out_features):
                 # s, r, c for seq_idx, expert_rank, out_channel, resp.
@@ -605,15 +583,11 @@ class MLPBlock(nn.Module):
                     # e_idx = e_indices[seq_idx, expert_rank]
 
                     sum_buffer = T.alloc_buffer((1,), dtype=einsum_dtype, scope="local")
-                    sum_buffer[0] = T.cast(
-                        bias[e_indices[seq_idx, expert_rank], out_idx], einsum_dtype
-                    )
+                    sum_buffer[0] = T.cast(bias[e_indices[seq_idx, expert_rank], out_idx], einsum_dtype)
 
                     for in_idx in T.serial(in_features):
                         if input_is_3d:
-                            sum_buffer[0] += T.cast(
-                                x[seq_idx, expert_rank, in_idx], einsum_dtype
-                            ) * T.cast(
+                            sum_buffer[0] += T.cast(x[seq_idx, expert_rank, in_idx], einsum_dtype) * T.cast(
                                 weight[e_indices[seq_idx, expert_rank], out_idx, in_idx],
                                 einsum_dtype,
                             )
@@ -650,9 +624,7 @@ class MLPBlock(nn.Module):
             out_handle: T.handle,
         ):
             T.func_attr({"op_pattern": 4, "tir.noalias": True})
-            x = T.match_buffer(
-                x_handle, (seq_len, experts_per_token, out_features), input_tensor.dtype
-            )
+            x = T.match_buffer(x_handle, (seq_len, experts_per_token, out_features), input_tensor.dtype)
             out = T.match_buffer(out_handle, (seq_len, out_features), out_dtype)
 
             for s, c in T.grid(seq_len, out_features):
@@ -663,9 +635,9 @@ class MLPBlock(nn.Module):
                     gate_buffer[0] = T.cast(0.0, block_dtype)
 
                     for expert_rank in T.serial(experts_per_token):
-                        gate_buffer[0] += T.cast(
-                            x[seq_idx, expert_rank, out_idx], block_dtype
-                        ) * T.cast(e_weights[seq_idx, expert_rank], block_dtype)
+                        gate_buffer[0] += T.cast(x[seq_idx, expert_rank, out_idx], block_dtype) * T.cast(
+                            e_weights[seq_idx, expert_rank], block_dtype
+                        )
 
                     out[seq_idx, out_idx] = T.cast(gate_buffer[0], out_dtype)
 
@@ -686,29 +658,21 @@ class MLPBlock(nn.Module):
         # here, type: (Tensor, Tensor)
         # top_k is 4
         # expert_indices: (seq_len, top_k)
-        expert_weights, expert_indices = nn.op.topk(
-            g, k=self.experts_per_token, axis=-1, largest=True
-        )
+        expert_weights, expert_indices = nn.op.topk(g, k=self.experts_per_token, axis=-1, largest=True)
         expert_weights = nn.op.softmax(expert_weights, axis=1)
 
         # MLP #1
         # self.mlp1_weight: (32, 5760, 2880)
         # self.mlp1_bias: (32, 5760)
-        mlp1_weight = self.__dequantize_mxfp4_weight(
-            self.mlp1_weight_blocks, self.mlp1_weight_scales
-        )
-        t = self.run_einsum(
-            t, expert_indices, mlp1_weight, self.mlp1_bias
-        )  # (seq_len, top_k, 5760)
+        mlp1_weight = self.__dequantize_mxfp4_weight(self.mlp1_weight_blocks, self.mlp1_weight_scales)
+        t = self.run_einsum(t, expert_indices, mlp1_weight, self.mlp1_bias)  # (seq_len, top_k, 5760)
         del mlp1_weight
         t = swiglu(t, limit=self.swiglu_limit, out_dtype="float32")  # (seq_len, top_k, 2880)
 
         # MLP #2
         # self.mlp2_weight: (32, 2880, 2880)
         # self.mlp2_bias: (32, 2880)
-        mlp2_weight = self.__dequantize_mxfp4_weight(
-            self.mlp2_weight_blocks, self.mlp2_weight_scales
-        )
+        mlp2_weight = self.__dequantize_mxfp4_weight(self.mlp2_weight_blocks, self.mlp2_weight_scales)
         t = self.run_einsum(t, expert_indices, mlp2_weight, self.mlp2_bias)
         del mlp2_weight
 
@@ -749,10 +713,7 @@ class Transformer(nn.Module):
         self.dtype = dtype
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
         self.block = nn.ModuleList(
-            [
-                TransformerBlock(config, layer_idx, dtype=dtype)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            [TransformerBlock(config, layer_idx, dtype=dtype) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = nn.RMSNorm(config.hidden_size, -1, bias=False, dtype=dtype)
         # to use MLC-LLM style, this part is in `GPTOssForCausalLM()`
@@ -823,9 +784,7 @@ class GPTOssForCausalLM(nn.Module):
 
         return nn.op.reshape(embed_, (1, -1, self.hidden_size))
 
-    def prefill(
-        self, input_embed: nn.Tensor, paged_kv_cache: PagedKVCache
-    ) -> tuple[nn.Tensor, PagedKVCache]:
+    def prefill(self, input_embed: nn.Tensor, paged_kv_cache: PagedKVCache) -> tuple[nn.Tensor, PagedKVCache]:
         op_ext.configure()
 
         def _index(x: te.Tensor):  # x[:-1,:]
@@ -840,9 +799,7 @@ class GPTOssForCausalLM(nn.Module):
 
         return logits, paged_kv_cache
 
-    def decode(
-        self, input_embed: nn.Tensor, paged_kv_cache: PagedKVCache
-    ) -> tuple[nn.Tensor, PagedKVCache]:
+    def decode(self, input_embed: nn.Tensor, paged_kv_cache: PagedKVCache) -> tuple[nn.Tensor, PagedKVCache]:
         op_ext.configure()
 
         hidden_states, paged_kv_cache = self.model(input_embed, paged_kv_cache, "decode")
@@ -859,8 +816,7 @@ class GPTOssForCausalLM(nn.Module):
         support_sliding_window: tir.Var,
     ) -> PagedKVCache:
         attention_layer_setting: list[Literal["mha", "mha_sliding"]] = [
-            "mha_sliding" if i % self.sw_pattern == 0 else "mha"
-            for i in range(self.num_hidden_layers)
+            "mha_sliding" if i % self.sw_pattern == 0 else "mha" for i in range(self.num_hidden_layers)
         ]
 
         return PagedKVCache.create_generic(

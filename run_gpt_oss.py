@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import numpy as np
-from engine import Engine
 from openai_harmony import (
     Conversation,
     HarmonyEncodingName,
@@ -13,17 +12,18 @@ from openai_harmony import (
 )
 from tqdm import tqdm
 
+from engine import Engine
+
+enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+
 
 def get_input_tokens():
     """get token sequence from openai-harmony or something"""
-    enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     conv = Conversation.from_messages(
         [
             Message.from_role_and_content(
                 Role.SYSTEM,
-                SystemContent.new().with_model_identity(
-                    "Your are ChatGPT, a large language model trained by OpenAI."
-                ),
+                SystemContent.new().with_model_identity("Your are ChatGPT, a large language model trained by OpenAI."),
             ),
             Message.from_role_and_content(Role.USER, "What is 2 + 2?"),
         ]
@@ -31,13 +31,11 @@ def get_input_tokens():
     tokens = enc.render_conversation_for_completion(conv, Role.ASSISTANT)
     tokens = np.array(tokens).astype("int32")
 
-    # temporary input sequence: [1, 1, 1, ...]
     return tokens
 
 
 def decode_tokens(tokens: list[int]):
-    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-    stream = StreamableParser(encoding, role=Role.ASSISTANT)
+    stream = StreamableParser(enc, role=Role.ASSISTANT)
 
     for token in tokens:
         stream.process(token)
@@ -59,19 +57,20 @@ def main(max_token_number: int = 64):
 
     seq_id = engine.begin_sequence(sliding_window_size=SLIDING_WINDOW_SIZE)
 
-    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-    stop_token_ids = encoding.stop_tokens_for_assistant_actions()
+    stop_token_ids = enc.stop_tokens_for_assistant_actions()
     generated_tokens = []
 
     # prefill stage
     input_tokens = get_input_tokens()
-    sampled_token = engine.prefill(input_tokens, seq_id)
+    prefill_logits = engine.prefill(input_tokens, seq_id)
+    sampled_token = engine.sample(prefill_logits)
     generated_tokens.append(sampled_token)
 
     # decode stage
     for _ in tqdm(range(max_token_number)):
         token_tensor = np.array([sampled_token], dtype=np.int32)
-        sampled_token = engine.decode(token_tensor, seq_id)
+        decode_logits = engine.decode(token_tensor, seq_id)
+        sampled_token = engine.sample(decode_logits)
         generated_tokens.append(sampled_token)
         if sampled_token in stop_token_ids:
             print("Got a stop token.")
