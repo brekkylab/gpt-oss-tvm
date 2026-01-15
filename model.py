@@ -1,23 +1,41 @@
 import dataclasses
-from typing import Any, Dict, Union, Optional, Tuple, List, Literal
-from math import sqrt, log, pi
 from functools import partial
+from math import log, pi, prod, sqrt
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-
-from tvm import te, tir, relax
-from tvm.script import tir as T
-from tvm.relax.frontend import nn
-from tvm.relax.frontend.nn import Tensor, op
-
-from mlc_llm import op as op_ext
 import mlc_llm.compiler_pass  # noqa: F401
+from mlc_llm import op as op_ext
 from mlc_llm.nn import PagedKVCache, RopeMode
 from mlc_llm.support import logging
 from mlc_llm.support.config import ConfigBase
 from mlc_llm.support.style import bold
-
+from tvm import relax, te, tir
+from tvm.relax.frontend import nn
+from tvm.relax.frontend.nn import Tensor, op
+from tvm.script import tir as T
 
 logger = logging.getLogger(__name__)
+
+
+# TODO: TEMP location, please re-locate this
+FP4_VALUES = [
+    +0.0,
+    +0.5,
+    +1.0,
+    +1.5,
+    +2.0,
+    +3.0,
+    +4.0,
+    +6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
 
 
 def yarn_find_correction_dim(
@@ -27,9 +45,8 @@ def yarn_find_correction_dim(
     max_position_embeddings: int,
 ):
     """Inverse dim formula to find dim based on number of rotations"""
-    return (
-            (d * log(max_position_embeddings / (num_rotations * 2 * pi)))
-            / (2 * log(theta))
+    return (d * log(max_position_embeddings / (num_rotations * 2 * pi))) / (
+        2 * log(theta)
     )
 
 
@@ -62,7 +79,6 @@ def rope_freq_yarn(
 
     exponent = d * 2 % d_range / tir.const(d_range, "float32")
     freq_power = tir.power(theta, exponent)
-
     freq_extra = tir.const(1, "float32") / freq_power
     freq_inter = tir.const(1, "float32") / (scaling_factor * freq_power)
 
@@ -73,6 +89,7 @@ def rope_freq_yarn(
     inv_freq_mask = tir.const(1, "float32") - tir.max(
         tir.min((d - low) / (high - low), 1.0), 0.0
     ).astype("float32")
+
     inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
     freq = s * inv_freq
     freq_var = tir.Var("freq", "float32")
@@ -87,26 +104,13 @@ def rope_freq_yarn(
 class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     """Configuration of the gpt-oss model."""
 
-    # only in Qwen3 (of MLC-LLM)
-    # hidden_act: str
-    # attention_bias: bool
-    # rms_norm_eps: float
     context_window_size: int = 40960
     prefill_chunk_size: int = 0
-    # tie_word_embeddings: bool = False
     tensor_parallel_shards: int = 1
     pipeline_parallel_stages: int = 1
     dtype: str = "bfloat16"
-    # max_batch_size: int = 1
-    # weight_block_size: Optional[Tuple[int, int]] = None
     kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
-    # Qwen3-MoE
-    # moe_intermediate_size: int = 0
-    # decoder_sparse_step: int = 0
-    # norm_topk_prob: bool = False
-
-    # common arguments: use MLC-LLM argument name
     num_hidden_layers: int = 36
     num_experts: int = 128
     num_experts_per_tok: int = 4  # in gpt-oss, `experts_per_token`
@@ -120,7 +124,6 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     rope_theta: Union[int, float] = 150000
     rope_scaling: Optional[Dict] = None
 
-    # only in gpt-oss
     swiglu_limit: float = 7.0
     # initial_context_length: int = 4096
     # rope_scaling_factor: float = 32.0
@@ -135,11 +138,11 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
             self.rope_scaling = {
                 # "rope_type": "yarn",
                 "rope_theta": float(self.rope_theta),
-                "factor": 32.0,   # in gpt-oss, `rope_scaling_factor`
+                "factor": 32.0,  # in gpt-oss, `rope_scaling_factor`
                 "beta_fast": 32.0,  # in gpt-oss, `rope_ntk_beta`
                 "beta_slow": 1.0,  # in gpt-oss, `rope_ntk_alpha`
                 "truncate": False,
-                "original_max_position_embeddings": 4096,  # in gpt-oss, `initial_context_length`?
+                "original_max_position_embeddings": 4096,  # in gpt-oss, `initial_context_length`
             }
 
         if "quantization_config" in self.kwargs:
@@ -165,47 +168,37 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
                     "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
                     "provided in `config.json`."
                 )
-        if self.num_key_value_heads == 0:
-            self.num_key_value_heads = self.num_attention_heads
-        if self.head_dim == 0:
-            self.head_dim = self.hidden_size // self.num_attention_heads
-        assert self.num_attention_heads % self.num_key_value_heads == 0
-        if self.prefill_chunk_size == 0:
-            logger.info(
-                "%s defaults to %d",
-                bold("prefill_chunk_size"),
-                min(
-                    self.context_window_size, 8192
-                ),  # TODO: min(context_window_size, 8192)?
-            )
-            self.prefill_chunk_size = min(
-                self.context_window_size, 8192
-            )  # TODO: min(context_window_size, 8192)?
-        elif self.prefill_chunk_size > self.context_window_size:
-            logger.info(
-                "Overriding %s from %d to %d",
-                bold("prefill_chunk_size"),
-                self.prefill_chunk_size,
-                min(
-                    self.context_window_size, 8192
-                ),  # TODO: min(context_window_size, 8192)?
-            )
-            self.prefill_chunk_size = min(
-                self.context_window_size, 8192
-            )  # TODO: min(context_window_size, 8192)?
+            if self.num_key_value_heads == 0:
+                self.num_key_value_heads = self.num_attention_heads
+            if self.head_dim == 0:
+                self.head_dim = self.hidden_size // self.num_attention_heads
+            assert self.num_attention_heads % self.num_key_value_heads == 0
+            # TODO: need to check `8192`; to another value
+            if self.prefill_chunk_size == 0:
+                self.prefill_chunk_size = min(self.context_window_size, 8192)
+                logger.info(
+                    "%s defaults to %d",
+                    bold("prefill_chunk_size"),
+                    self.prefill_chunk_size,
+                )
+            elif self.prefill_chunk_size > self.context_window_size:
+                logger.info(
+                    "Overriding %s from %d to %d",
+                    bold("prefill_chunk_size"),
+                    self.prefill_chunk_size,
+                    min(self.context_window_size, 8192),
+                )
+                self.prefill_chunk_size = min(self.context_window_size, 8192)
 
 
 class AttentionBlock(nn.Module):
     def __init__(
-            self,
-            config: GPTOssConfig,
-            layer_idx: int = 0,
-            dtype: Optional[str] = None
+        self, config: GPTOssConfig, layer_idx: int = 0, dtype: Optional[str] = None
     ):
         assert config
         self.config = config
         if dtype is None:
-            dtype = self.config.dtype  # default is "bfloat16"
+            dtype = config.dtype  # default is "bfloat16"
         self.dtype = dtype
         self.head_dim = config.head_dim
         self.num_attention_heads = config.num_attention_heads
@@ -215,11 +208,9 @@ class AttentionBlock(nn.Module):
         self.rope_theta = config.rope_theta
 
         self.sinks = nn.Parameter((config.num_attention_heads,), dtype=dtype)
-        self.norm = nn.RMSNorm(
-            config.hidden_size, axes=-1, bias=False, dtype=dtype
-        )
+        self.norm = nn.RMSNorm(config.hidden_size, axes=-1, bias=False, dtype=dtype)
         qkv_dim = config.head_dim * (
-                config.num_attention_heads + 2 * config.num_key_value_heads
+            config.num_attention_heads + 2 * config.num_key_value_heads
         )
         self.qkv = nn.Linear(config.hidden_size, qkv_dim, bias=True, dtype=dtype)
         self.out = nn.Linear(
@@ -232,23 +223,23 @@ class AttentionBlock(nn.Module):
         self.layer_idx = layer_idx  # for MLC-LLM PagedKVCache
 
     def _rope(
-            self,
-            x: te.Tensor,
-            positions: te.Tensor,
-            rotary_dim: int,
-            theta: Union[float, tir.Var],
-            rope_scaling: Optional[Dict[str, Any]] = None,
+        self,
+        x: te.Tensor,
+        positions: te.Tensor,
+        rotary_dim: int,
+        theta: Union[float, tir.Var],
+        rope_scaling: Optional[Dict[str, Any]] = None,
     ):
         x_dtype = x.dtype
         if rope_scaling is None:
             rope_scaling = {
                 # "rope_type": "yarn",
                 "rope_theta": float(self.rope_theta),
-                "factor": 32.0,   # in gpt-oss, `rope_scaling_factor`
-                "beta_fast": 32.0,  # in gpt-oss, `rope_ntk_beta`
-                "beta_slow": 1.0,  # in gpt-oss, `rope_ntk_alpha`
+                "factor": 32.0,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
                 "truncate": False,
-                "original_max_position_embeddings": 4096,  # in gpt-oss, `initial_context_length`?
+                "original_max_position_embeddings": 4096,
             }
 
         if isinstance(theta, tir.Var):
@@ -256,17 +247,16 @@ class AttentionBlock(nn.Module):
 
         yarn_ftn = partial(
             rope_freq_yarn,
-            original_max_position_embeddings=rope_scaling["original_max_position_embeddings"],
+            original_max_position_embeddings=rope_scaling[
+                "original_max_position_embeddings"
+            ],
             scaling_factor=rope_scaling["factor"],
             beta_fast=rope_scaling["beta_fast"],
             beta_slow=rope_scaling["beta_slow"],
         )
 
         def _rope_compute(
-                batch_idx: tir.Var,
-                seq_idx: tir.Var,
-                head_idx: tir.Var,
-                dim_idx: tir.Var
+            batch_idx: tir.Var, seq_idx: tir.Var, head_idx: tir.Var, dim_idx: tir.Var
         ):
             # suppose that rotary_dim % 2 == 0
             rotary_half = rotary_dim // 2
@@ -292,10 +282,7 @@ class AttentionBlock(nn.Module):
             )
 
             scale_val = rope_scaling.get("factor", 1.0)
-            if scale_val > 1.0:
-                conc_val = 0.1 * log(scale_val) + 1.0
-            else:
-                conc_val = 1.0
+            conc_val = 0.1 * log(scale_val) + 1.0 if scale_val > 1.0 else 1.0
 
             concentration = tir.const(conc_val, "float32")
             cos_val = cos_freq * concentration
@@ -306,8 +293,10 @@ class AttentionBlock(nn.Module):
 
             out_rope = tir.if_then_else(
                 is_imaginary,
-                partner_val * sin_val + val * cos_val,  # for y, y_rotated = x * sin + y * cos
-                val * cos_val - partner_val * sin_val  # for x, x_rotated = x * cos - y * sin
+                partner_val * sin_val
+                + val * cos_val,  # for y, y_rotated = x * sin + y * cos
+                val * cos_val
+                - partner_val * sin_val,  # for x, x_rotated = x * cos - y * sin
             )
 
             for var, value in var_map.items():
@@ -317,12 +306,7 @@ class AttentionBlock(nn.Module):
 
         return te.compute(x.shape, _rope_compute, name="yarn_rope")
 
-    def apply_rotation_to_qk(
-            self,
-            q: Tensor,
-            k: Tensor,
-            positions: Tensor
-    ):
+    def apply_rotation_to_qk(self, q: Tensor, k: Tensor, positions: Tensor):
         rope_ftn = partial(
             self._rope,
             rotary_dim=self.config.head_dim,
@@ -334,10 +318,10 @@ class AttentionBlock(nn.Module):
         return q_embed, k_embed
 
     def forward(
-            self,
-            x: Tensor,
-            paged_kv_cache: PagedKVCache,  # for MLC-LLM style
-            query_positions: Tensor
+        self,
+        x: Tensor,
+        paged_kv_cache: PagedKVCache,  # for MLC-LLM style
+        query_positions: Tensor,
     ):
         d = self.head_dim
         n_q_heads = self.num_attention_heads
@@ -348,11 +332,11 @@ class AttentionBlock(nn.Module):
         # from `CausalLM.prefill()`,
         # get t of shape (batch_size, num_tokens, d)
         batch_size = 1
-        # # batch_size, num_tokens, _ = t.shape  # x: from embedding layer; batch size is 1 for test
 
         # [1, seq_len, 2880]
         if len(t.shape) == 3:
-            _, num_tokens, _ = t.shape  # x: from embedding layer; batch size is 1 for test
+            _, num_tokens, _ = t.shape
+            # batch_size, num_tokens, _; x: from embedding layer; batch size is 1 for test
         else:
             # [seq_len, 2880]
             num_tokens, _ = t.shape
@@ -362,11 +346,7 @@ class AttentionBlock(nn.Module):
             qkv,
             (batch_size, num_tokens, n_q_heads + n_kv_heads + n_kv_heads, d),
         )
-        q, k, v = op.split(
-            qkv,
-            [n_q_heads, n_q_heads + n_kv_heads],
-            axis=2
-        )
+        q, k, v = op.split(qkv, [n_q_heads, n_q_heads + n_kv_heads], axis=2)
 
         q, k = self.apply_rotation_to_qk(q, k, query_positions)
         # `lse_qk` is always f32
@@ -390,17 +370,15 @@ class AttentionBlock(nn.Module):
             attention,
             (batch_size, num_tokens, n_q_heads * d),
         )
-        # return t
 
         t = self.out(t)
+        t = t.astype(self.dtype)
+
         return x + t
 
 
 def swiglu(
-        x: Tensor,
-        alpha: float = 1.702,
-        limit: float = 7.0,
-        out_dtype: str = "bfloat16"
+    x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16"
 ) -> Tensor:
     shape = x.shape
     batch_shape = shape[:-1]
@@ -410,11 +388,7 @@ def swiglu(
     # reshape: (..., 2 * d) -> (..., d, 2)
     x_reshaped = op.reshape(x, (*batch_shape, d, 2))
 
-    chunks = relax.op.split(
-        x_reshaped._expr,
-        indices_or_sections=2,
-        axis=-1
-    )
+    chunks = relax.op.split(x_reshaped._expr, indices_or_sections=2, axis=-1)
     chunk_glu = relax.TupleGetItem(chunks, 0)
     chunk_linear = relax.TupleGetItem(chunks, 1)
 
@@ -424,19 +398,13 @@ def swiglu(
     x_linear_expr = relax.op.squeeze(chunk_linear, axis=-1)
     x_linear_expr = relax.op.astype(x_linear_expr, dtype=out_dtype)
 
-    alpha = op.wrap_nested(
-        relax.const(alpha, dtype=out_dtype),
-        name="alpha_const"
-    )
+    alpha = op.wrap_nested(relax.const(alpha, dtype=out_dtype), name="alpha_const")
     limit_expr = relax.const(limit, dtype=out_dtype)
 
-    x_glu = op.wrap_nested(
-        relax.op.minimum(x_glu_expr, limit_expr),
-        name="x_glu_clip"
-    )
+    x_glu = op.wrap_nested(relax.op.minimum(x_glu_expr, limit_expr), name="x_glu_clip")
     x_linear = op.wrap_nested(
         relax.op.clip(x_linear_expr, min=-limit, max=limit),  # type: ignore
-        name="x_linear_clip"
+        name="x_linear_clip",
     )
 
     gating = x_glu * op.sigmoid(alpha * x_glu)
@@ -447,11 +415,13 @@ def swiglu(
 
 class MLPBlock(nn.Module):
     def __init__(
-            self,
-            config: GPTOssConfig,
-            rms_norm_eps: float = 1e-5,
-            dtype: Optional[str] = None
+        self,
+        config: GPTOssConfig,
+        rms_norm_eps: float = 1e-5,
+        dtype: Optional[str] = None,
     ):
+        """this block has the inner-dequantization of MXFP4 format weights"""
+
         assert config
         if dtype is None:
             dtype = config.dtype  # default is "bfloat16"
@@ -474,24 +444,51 @@ class MLPBlock(nn.Module):
             dtype=dtype,
         )
         assert config.intermediate_size % self.world_size == 0
-        self.mlp1_weight = nn.Parameter(
+
+        # for MXFP4 dequantization
+        mxfp4_dtype = "uint8"
+        mxfp4_group_size = 90
+        mxfp4_block_length = 16  # bytes_per_block
+
+        self.mlp1_weight_blocks = nn.Parameter(
             (
                 self.num_experts,
                 config.intermediate_size * 2 // self.world_size,
-                config.hidden_size,
+                mxfp4_group_size,
+                mxfp4_block_length,
             ),
-            dtype=dtype,
+            dtype=mxfp4_dtype,
         )
-        self.mlp1_bias = nn.Parameter(
-            (self.num_experts, config.intermediate_size * 2 // self.world_size),
-            dtype=dtype,
+        self.mlp1_weight_scales = nn.Parameter(
+            (
+                self.num_experts,
+                config.intermediate_size * 2 // self.world_size,
+                mxfp4_group_size,
+            ),
+            dtype=mxfp4_dtype,
         )
-        self.mlp2_weight = nn.Parameter(
+        self.mlp2_weight_blocks = nn.Parameter(
             (
                 self.num_experts,
                 config.hidden_size,
-                config.intermediate_size // self.world_size,
+                mxfp4_group_size,
+                mxfp4_block_length,
             ),
+            dtype=mxfp4_dtype,
+        )
+        self.mlp2_weight_scales = nn.Parameter(
+            (
+                self.num_experts,
+                config.hidden_size,
+                mxfp4_group_size,
+            ),
+            dtype=mxfp4_dtype,
+        )
+
+        # mlp_weights are processed in `.forward()`
+
+        self.mlp1_bias = nn.Parameter(
+            (self.num_experts, config.intermediate_size * 2 // self.world_size),
             dtype=dtype,
         )
         self.mlp2_bias = nn.Parameter(
@@ -499,16 +496,85 @@ class MLPBlock(nn.Module):
             dtype=dtype,
         )
 
-    @staticmethod
-    def _run_einsum(
-            input_tensor: Tensor,
-            expert_indices: Tensor,
-            weight_tensor: Tensor,
-            bias_tensor: Tensor
-    ) -> Tensor:
+    def __dequantize_mxfp4_weight(
+        self,
+        blocks: nn.Tensor,
+        scales: nn.Tensor,
+        rows_per_chunk: Optional[int] = None,  # unused, kept for compatibility
+    ) -> nn.Tensor:
+        import numpy as np
+
+        if rows_per_chunk is None:
+            rows_per_chunk = 16384 * 512
+        scales = scales.astype("int32") - 127
+        assert blocks.shape[:-1] == scales.shape, (
+            f"{blocks.shape=} does not match {scales.shape=}"
+        )
+        out_dtype = self.dtype
+
+        lut = nn.Tensor.from_const(np.array(FP4_VALUES, dtype=out_dtype))
+
+        *prefix_shape, group_size, bytes_per_block = blocks.shape
+        total_rows = prod(prefix_shape) * group_size
+
+        blocks = blocks.reshape(total_rows, bytes_per_block)
+        scales = scales.reshape(total_rows, 1)
+
+        @T.prim_func(private=True)
+        def dequant_kernel(
+            blocks_handle: T.handle,
+            scales_handle: T.handle,
+            lut_handle: T.handle,
+            out_handle: T.handle,
+        ):
+            T.func_attr({"tir.noalias": True, "tir.is_scheduled": 1})
+            blocks_buf = T.match_buffer(
+                blocks_handle, (total_rows, bytes_per_block), "uint8"
+            )
+            scales_buf = T.match_buffer(scales_handle, (total_rows, 1), "int32")
+            lut_buf = T.match_buffer(lut_handle, (16,), out_dtype)
+            out_buf = T.match_buffer(
+                out_handle, (total_rows, 2 * bytes_per_block), out_dtype
+            )
+
+            with T.block("init_dequantize"):
+                for i in T.thread_binding(total_rows, thread="blockIdx.x"):
+                    for j in T.thread_binding(bytes_per_block, thread="threadIdx.x"):
+                        with T.block("run_dequantize"):
+                            vi, vj = T.axis.remap("SS", [i, j])
+                            block_val = blocks_buf[vi, vj]
+                            exp_val = scales_buf[vi, 0]
+
+                            idx_low = T.cast(block_val & T.uint8(0x0F), "int64")
+                            idx_high = T.cast(block_val >> T.uint8(4), "int64")
+
+                            ldexp_scale = T.exp2(T.cast(exp_val, "float32"))
+                            out_buf[vi, 2 * vj] = lut_buf[idx_low] * ldexp_scale
+                            out_buf[vi, 2 * vj + 1] = lut_buf[idx_high] * ldexp_scale
+
+        out = nn.tensor_ir_op(
+            dequant_kernel,
+            "dequant_mxfp4",
+            args=[blocks, scales, lut],
+            out=nn.Tensor.placeholder(
+                (total_rows, 2 * bytes_per_block), dtype=out_dtype
+            ),
+        )
+
+        return out.reshape(*prefix_shape, 2 * group_size * bytes_per_block)
+
+    def run_einsum(
+        self,
+        input_tensor: nn.Tensor,
+        expert_indices: nn.Tensor,
+        weight_tensor: nn.Tensor,
+        bias_tensor: nn.Tensor,
+        safetensor_dtype: Optional[str] = None,
+    ) -> nn.Tensor:
         # input_dtype -> f32
         einsum_dtype = "float32"
-        safetensor_dtype = "bfloat16"
+        if safetensor_dtype is None:
+            safetensor_dtype = self.dtype
 
         # here, len(input_tensor.shape) is 2 or 3
         # (seq_len, 2880); normed tensor in 1st operation
@@ -520,23 +586,26 @@ class MLPBlock(nn.Module):
         input_is_3d = len(input_shape) == 3
 
         _, experts_per_token = expert_indices.shape  # (seq_len, 4)
-        num_all_experts, out_features, _ = weight_tensor.shape  # (32, 5760, 2880) | (32, 2880, 2880)
+        num_all_experts, out_features, _ = (
+            weight_tensor.shape
+        )  # (32, 5760, 2880) | (32, 2880, 2880)
 
         @T.prim_func(private=True)
         def _einsum_matrix(
-                x_handle: T.handle,
-                e_indices: T.Buffer((seq_len, experts_per_token), "int32"),
-                weight: T.Buffer((num_all_experts, out_features, in_features), safetensor_dtype),
-                bias: T.Buffer((num_all_experts, out_features), safetensor_dtype),
-                out_handle: T.handle
+            x_handle: T.handle,
+            e_indices: T.Buffer((seq_len, experts_per_token), "int32"),
+            weight: T.Buffer(
+                (num_all_experts, out_features, in_features), safetensor_dtype
+            ),
+            bias: T.Buffer((num_all_experts, out_features), safetensor_dtype),
+            out_handle: T.handle,
         ):
-
-            T.func_attr({"op_pattern": 4, "tir.noalias": True})
+            T.func_attr(
+                {"op_pattern": 4, "tir.noalias": True}
+            )  # pattern #4 is kOutEWiseFusable (matmul)
             x = T.match_buffer(x_handle, input_shape, input_tensor.dtype)
             out = T.match_buffer(
-                out_handle,
-                (seq_len, experts_per_token, out_features),
-                einsum_dtype
+                out_handle, (seq_len, experts_per_token, out_features), einsum_dtype
             )
 
             for s, r, c in T.grid(seq_len, experts_per_token, out_features):
@@ -546,132 +615,135 @@ class MLPBlock(nn.Module):
                     seq_idx, expert_rank, out_idx = T.axis.remap("SSS", [s, r, c])
                     # e_idx = e_indices[seq_idx, expert_rank]
 
-                    sum_buffer = T.alloc_buffer((1, ), dtype=einsum_dtype, scope="local")
-                    sum_buffer[0] = T.cast(bias[e_indices[seq_idx, expert_rank], out_idx], einsum_dtype)
+                    sum_buffer = T.alloc_buffer((1,), dtype=einsum_dtype, scope="local")
+                    sum_buffer[0] = T.cast(
+                        bias[e_indices[seq_idx, expert_rank], out_idx], einsum_dtype
+                    )
 
                     for in_idx in T.serial(in_features):
                         if input_is_3d:
-                            sum_buffer[0] += (
-                                T.cast(x[seq_idx, expert_rank, in_idx], einsum_dtype) *
-                                T.cast(weight[e_indices[seq_idx, expert_rank], out_idx, in_idx], einsum_dtype)
+                            sum_buffer[0] += T.cast(
+                                x[seq_idx, expert_rank, in_idx], einsum_dtype
+                            ) * T.cast(
+                                weight[
+                                    e_indices[seq_idx, expert_rank], out_idx, in_idx
+                                ],
+                                einsum_dtype,
                             )
                         else:
-                            sum_buffer[0] += (
-                                T.cast(x[seq_idx, in_idx], einsum_dtype) *
-                                T.cast(weight[e_indices[seq_idx, expert_rank], out_idx, in_idx], einsum_dtype)
+                            sum_buffer[0] += T.cast(
+                                x[seq_idx, in_idx], einsum_dtype
+                            ) * T.cast(
+                                weight[
+                                    e_indices[seq_idx, expert_rank], out_idx, in_idx
+                                ],
+                                einsum_dtype,
                             )
                     out[seq_idx, expert_rank, out_idx] = sum_buffer[0]
 
-        return op.tensor_ir_op(
+        return nn.tensor_ir_op(
             _einsum_matrix,
             "moe_gemv_einsum",
             args=[input_tensor, expert_indices, weight_tensor, bias_tensor],
-            out=Tensor.placeholder((seq_len, experts_per_token, out_features), einsum_dtype),
+            out=nn.Tensor.placeholder(
+                (seq_len, experts_per_token, out_features), einsum_dtype
+            ),
         )
 
-    @staticmethod
-    def _run_gating(
-            input_tensor: Tensor,
-            expert_weights: Tensor,
+    def run_gating(
+        self,
+        input_tensor: nn.Tensor,
+        expert_weights: nn.Tensor,
+        out_dtype: Optional[str] = None,
     ):
         # f32 -> out_dtype
         seq_len, experts_per_token, out_features = input_tensor.shape
         block_dtype = "float32"
-        out_dtype = "bfloat16"
+        if out_dtype is None:
+            out_dtype = self.dtype
 
         @T.prim_func(private=True)
         def _apply_gate(
-                x_handle: T.handle,
-                e_weights: T.Buffer((seq_len, experts_per_token), "bfloat16"),
-                # e_weights: T.Buffer((seq_len, experts_per_token), "float32"),
-                out_handle: T.handle
+            x_handle: T.handle,
+            e_weights: T.Buffer((seq_len, experts_per_token), out_dtype),
+            out_handle: T.handle,
         ):
             T.func_attr({"op_pattern": 4, "tir.noalias": True})
-            x = T.match_buffer(x_handle, (seq_len, experts_per_token, out_features), input_tensor.dtype)
-            out = T.match_buffer(
-                out_handle,
-                (seq_len, out_features),
-                out_dtype
+            x = T.match_buffer(
+                x_handle, (seq_len, experts_per_token, out_features), input_tensor.dtype
             )
+            out = T.match_buffer(out_handle, (seq_len, out_features), out_dtype)
 
             for s, c in T.grid(seq_len, out_features):
                 with T.block("apply_gate"):
                     seq_idx, out_idx = T.axis.remap("SS", [s, c])
 
-                    gate_buffer = T.alloc_buffer((1, ), dtype=block_dtype, scope="local")
+                    gate_buffer = T.alloc_buffer((1,), dtype=block_dtype, scope="local")
                     gate_buffer[0] = T.cast(0.0, block_dtype)
 
                     for expert_rank in T.serial(experts_per_token):
-                        gate_buffer[0] += (
-                                T.cast(x[seq_idx, expert_rank, out_idx], block_dtype) *
-                                T.cast(e_weights[seq_idx, expert_rank], block_dtype)
-                        )
+                        gate_buffer[0] += T.cast(
+                            x[seq_idx, expert_rank, out_idx], block_dtype
+                        ) * T.cast(e_weights[seq_idx, expert_rank], block_dtype)
 
                     out[seq_idx, out_idx] = T.cast(gate_buffer[0], out_dtype)
 
-
-        return op.tensor_ir_op(
+        return nn.tensor_ir_op(
             _apply_gate,
             "moe_gemv_gating",
             args=[input_tensor, expert_weights],
-            out=Tensor.placeholder((seq_len, out_features), out_dtype),
+            out=nn.Tensor.placeholder((seq_len, out_features), out_dtype),
         )
 
-    def execute_moe_gemv(
-            self,
-            mode: Literal["einsum", "gating"] = "einsum",
-            *args,
-    ) -> Tensor:
-        if mode == "einsum":
-            return_ftn = self._run_einsum
-        elif mode == "gating":
-            return_ftn = self._run_gating
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-
-        return return_ftn(*args)
-
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: nn.Tensor) -> nn.Tensor:
         b, seq_len, dim = x.shape
-        x = op.reshape(x, (b * seq_len, dim))
+        x = nn.op.reshape(x, (b * seq_len, dim))
 
-        # t: (seq_len, 2880)
-        # g: (seq_len, 32)
-        t = self.norm(x)
-        g = self.gate(t)
+        t = self.norm(x)  # t: (seq_len, 2880)
+        g = self.gate(t)  # g: (seq_len, 32)
 
         # here, type: (Tensor, Tensor)
         # top_k is 4
         # expert_indices: (seq_len, top_k)
-        expert_weights, expert_indices = op.topk(
+        expert_weights, expert_indices = nn.op.topk(
             g, k=self.experts_per_token, axis=-1, largest=True
         )
-        expert_weights = op.softmax(expert_weights, axis=1)
+        expert_weights = nn.op.softmax(expert_weights, axis=1)
 
         # MLP #1
         # self.mlp1_weight: (32, 5760, 2880)
         # self.mlp1_bias: (32, 5760)
-        t = self.execute_moe_gemv("einsum", t, expert_indices, self.mlp1_weight, self.mlp1_bias)  # (seq_len, top_k, 5760)
-        t = swiglu(t, limit=self.swiglu_limit, out_dtype="float32")  # (seq_len, top_k, 2880)
+        mlp1_weight = self.__dequantize_mxfp4_weight(
+            self.mlp1_weight_blocks, self.mlp1_weight_scales
+        )
+        t = self.run_einsum(
+            t, expert_indices, mlp1_weight, self.mlp1_bias
+        )  # (seq_len, top_k, 5760)
+        del mlp1_weight
+        t = swiglu(
+            t, limit=self.swiglu_limit, out_dtype="float32"
+        )  # (seq_len, top_k, 2880)
 
         # MLP #2
         # self.mlp2_weight: (32, 2880, 2880)
         # self.mlp2_bias: (32, 2880)
-        t = self.execute_moe_gemv("einsum", t, expert_indices, self.mlp2_weight, self.mlp2_bias)
+        mlp2_weight = self.__dequantize_mxfp4_weight(
+            self.mlp2_weight_blocks, self.mlp2_weight_scales
+        )
+        t = self.run_einsum(t, expert_indices, mlp2_weight, self.mlp2_bias)
+        del mlp2_weight
 
         # Weighted sum of experts
-        t = self.execute_moe_gemv("gating", t, expert_weights)
-        t = op.reshape(t, x.shape)  # this resolves inconsistent buffer error
+        t = self.run_gating(t, expert_weights)
+        t = nn.op.reshape(t, x.shape)  # this resolves inconsistent buffer error
+        t = t.astype(self.dtype)
 
-        return op.reshape(x + t, (b, seq_len, dim))
+        return nn.op.reshape(x + t, (b, seq_len, dim))
 
 
 class TransformerBlock(nn.Module):
     def __init__(
-            self,
-            config: GPTOssConfig,
-            layer_idx: int,
-            dtype: Optional[str] = None
+        self, config: GPTOssConfig, layer_idx: int, dtype: Optional[str] = None
     ):
         assert config
         if dtype is None:
@@ -680,10 +752,7 @@ class TransformerBlock(nn.Module):
         self.mlp = MLPBlock(config, dtype=dtype)
 
     def forward(
-            self,
-            x: Tensor,
-            paged_kv_cache: PagedKVCache,
-            query_positions: Tensor
+        self, x: Tensor, paged_kv_cache: PagedKVCache, query_positions: Tensor
     ) -> Tensor:
         x = self.attn(x, paged_kv_cache, query_positions)
         x = self.mlp(x)
@@ -704,9 +773,7 @@ class Transformer(nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = nn.RMSNorm(
-            config.hidden_size, -1, bias=False, dtype=dtype
-        )
+        self.norm = nn.RMSNorm(config.hidden_size, -1, bias=False, dtype=dtype)
         # to use MLC-LLM style, this part is in `GPTOssForCausalLM()`
         # self.unembedding = nn.Linear(
         #     config.hidden_size,
@@ -720,7 +787,7 @@ class Transformer(nn.Module):
         # x = self.embedding(x)  # in embed() function
         for block in self.block:
             x = block(x, paged_kv_cache, query_positions)
-        # x = self.norm(x)
+        x = self.norm(x)
 
         # to use MLC-LLM style, this part is in `GPTOssForCausalLM()`
         # x = self.unembedding(x)
@@ -772,9 +839,7 @@ class GPTOssForCausalLM(nn.Module):
         return self.model.embedding(input_ids)
 
     def prefill(
-            self,
-            input_embed: Tensor,
-            paged_kv_cache: PagedKVCache
+        self, input_embed: Tensor, paged_kv_cache: PagedKVCache
     ) -> Tuple[Tensor, PagedKVCache]:
         op_ext.configure()
 
@@ -784,14 +849,13 @@ class GPTOssForCausalLM(nn.Module):
         return hidden_states, paged_kv_cache
 
     def create_paged_kv_cache(  # pylint: disable=too-many-arguments
-            self,
-            max_batch_size: tir.Var,
-            max_total_seq_len: tir.Var,
-            prefill_chunk_size: tir.Var,
-            page_size: tir.Var,
-            support_sliding_window: tir.Var,
+        self,
+        max_batch_size: tir.Var,
+        max_total_seq_len: tir.Var,
+        prefill_chunk_size: tir.Var,
+        page_size: tir.Var,
+        support_sliding_window: tir.Var,
     ) -> PagedKVCache:
-
         attention_layer_setting: List[Literal["mha", "mha_sliding"]] = [
             "mha_sliding" if i % self.sw_pattern == 0 else "mha"
             for i in range(self.num_hidden_layers)
@@ -799,13 +863,11 @@ class GPTOssForCausalLM(nn.Module):
 
         return PagedKVCache.create_generic(
             attn_kind=attention_layer_setting,
-            # attn_kind="mha",
             max_batch_size=max_batch_size,
             max_total_seq_len=max_total_seq_len,
             prefill_chunk_size=prefill_chunk_size,
             page_size=page_size,
             support_sliding_window=support_sliding_window,
-            # layer_partition=relax.ShapeExpr([0, self.num_hidden_layers]),
             num_hidden_layers=self.num_hidden_layers,
             num_attention_heads=self.num_attention_heads // self.tensor_parallel_shards,
             num_key_value_heads=self.num_key_value_heads // self.tensor_parallel_shards,
@@ -815,12 +877,7 @@ class GPTOssForCausalLM(nn.Module):
             rope_scale=1,
             rope_theta=self.rope_theta,
             rope_scaling=self.rope_scaling,
-            # rope_ext_factors=relax.PrimValue(0),
-            # rotary_dim=self.head_dim,
             dtype=self.dtype,
-            # dtype="float32",
-            # target=target,
-            # enable_disaggregation=False,
         )
 
     def get_default_spec(self):
@@ -833,7 +890,9 @@ class GPTOssForCausalLM(nn.Module):
                 },
             },
             "prefill": {
-                "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], "bfloat16"),
+                "input_embed": nn.spec.Tensor(
+                    [1, "seq_len", self.hidden_size], self.dtype
+                ),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
                 "$": {
                     "param_mode": "packed",
