@@ -29,6 +29,7 @@ cd -
 
 # mlc-llm
 cd 3rdparty/mlc-llm/python
+# if you use macOS, you need to exclude `flashinfer` dependency from `./requirements.txt`
 pip install -e .
 cd -
 ```
