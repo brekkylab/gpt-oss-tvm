@@ -289,7 +289,6 @@ class Engine():
 
         return out
 
-
     def _create_paged_kv_cache(self):
         # TODO: replace hard-coded values
         # TODO: for now, config value causes `buf != nil` error
@@ -331,7 +330,6 @@ class Engine():
             self._f_embed,
             input_tokens,
         )
-        input_embed = np.expand_dims(input_embed, axis=0)   # [seq_len] -> [1, seq_len]
         input_length = input_embed.shape[1]
 
         self._f_begin_forward(

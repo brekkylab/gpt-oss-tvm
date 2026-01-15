@@ -819,8 +819,9 @@ class GPTOssForCausalLM(nn.Module):
     def embed(self, input_ids: Tensor) -> Tensor:
         if self.tensor_parallel_shards > 1:
             input_ids = op.ccl_broadcast_from_worker0(input_ids)
+        embed_ = self.model.embedding(input_ids)
 
-        return self.model.embedding(input_ids)
+        return nn.op.reshape(embed_, (1, -1, self.hidden_size))
 
     def prefill(
         self, input_embed: nn.Tensor, paged_kv_cache: PagedKVCache
