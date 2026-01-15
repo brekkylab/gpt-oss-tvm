@@ -65,8 +65,8 @@ def build_shards_from_safetensors(
     st_path = Path(st_path) / "model.safetensors" if st_path.suffix != ".safetensors" else st_path
     if not st_path.exists():
         raise FileNotFoundError(
-            f"safetensor not found: {st_path}"
-            f"please run: `huggingface-cli download openai/gpt-oss-20b --local-dir {st_path.parent}`"
+            f"safetensor not found: {st_path}\n"
+            f"please run: `hf download openai/gpt-oss-20b --local-dir {st_path.parent}`"
         )
 
     block_indices = set(block_indices) if block_indices else None
@@ -187,8 +187,10 @@ class Engine():
 
         self._f_embed = self._vm["embed"]
         self._f_prefill = self._vm["prefill"]
-        # self._f_decode = self._vm["decode"]
+        self._f_decode = self._vm["decode"]
+
         self._f_sample = tvm.get_global_func("vm.builtin.sample_top_p_from_logits")
+        self.sample_parameters = {"temperature": 0.7, "top_p": 0.9, "random_seed": 0.5}
 
         self._f_kv_cache_clear = tvm.get_global_func("vm.builtin.kv_state_clear")
         self._f_add_sequence = tvm.get_global_func("vm.builtin.kv_state_add_sequence")
@@ -270,7 +272,7 @@ class Engine():
 
     def _run_tvm_function(
         self,
-        func,
+        func: Callable,
         input: np.ndarray,
         use_kv_cache: bool = False,
     ) -> np.ndarray:
@@ -283,28 +285,18 @@ class Engine():
         else:
             tvm_output = func(input_tensor, self.params)
 
-        # TODO: Check this if-statement is really needed
-        if isinstance(tvm_output, (list, tuple)):
-            results = []
-            for out in tvm_output:
-                if hasattr(out, "numpy"):
-                    results.append(out.numpy())
-                else:
-                    results.append(out)
-            out = results
-        elif hasattr(tvm_output, "numpy"):
-            out = tvm_output.numpy()
-        else:
-            out = tvm_output
-        # return result as numpy array
+        out = tvm_output.numpy() if hasattr(tvm_output, "numpy") else tvm_output
+
         return out
+
 
     def _create_paged_kv_cache(self):
         # TODO: replace hard-coded values
+        # TODO: for now, config value causes `buf != nil` error
         return self._f_create_kv_cache(  # pylint: disable=too-many-arguments
             tvm.runtime.ShapeTuple([1]),  # max_batch_size
-            tvm.runtime.ShapeTuple([8192]),  # max_total_seq_len
-            tvm.runtime.ShapeTuple([8192]),  # prefill_chunk_size
+            tvm.runtime.ShapeTuple([8192]),  # max_total_seq_len: self.config.context_window_size
+            tvm.runtime.ShapeTuple([8192]),  # prefill_chunk_size: self.config.prefill_chunk_size
             tvm.runtime.ShapeTuple([16]),  # page_size
             tvm.runtime.ShapeTuple([1]),  # support_sliding_window
         )
@@ -367,17 +359,17 @@ class Engine():
             return logits
         return self.sample(logits)
 
-    # def decode(
-    #     self,
-    #     input_tokens: np.ndarray,
-    #     sequence_id: int = 0,
-    #     sample: bool = True,
-    # ) -> int:
-    #     logits = self.forward(input_tokens, self._f_decode, sequence_id)
-    #     if not sample:
-    #         return logits
-    #     return self.sample(logits)
+    def decode(
+        self,
+        input_tokens: np.ndarray,
+        sequence_id: int = 0,
+        sample: bool = True,
+    ) -> int:
+        logits = self.forward(input_tokens, self._f_decode, sequence_id)
+        if not sample:
+            return logits
+        return self.sample(logits)
 
     def sample(self, logits: np.ndarray):
-        new_token_id = self._f_sample(logits, self.temperature, self.top_p, random.random())
+        new_token_id = self._f_sample(logits, *self.sample_parameters.values())
         return new_token_id
