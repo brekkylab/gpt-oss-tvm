@@ -84,7 +84,7 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     tensor_parallel_shards: int = 1
     pipeline_parallel_stages: int = 1
     dtype: str = "bfloat16"
-    kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     num_hidden_layers: int = 36
     num_experts: int = 128
@@ -96,8 +96,8 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     num_attention_heads: int = 64
     num_key_value_heads: int = 8
     sliding_window_size: int = 128
-    rope_theta: Union[int, float] = 150000
-    rope_scaling: Optional[Dict] = None
+    rope_theta: int | float = 150000
+    rope_scaling: dict | None = None
     swiglu_limit: float = 7.0
 
     # to use alternating dense-sliding Attention

@@ -30,7 +30,7 @@ class Engine:
 
         # load model
         self._vm = relax.VirtualMachine(ex, self.device)
-        self.params = TVMCheckpoint(checkpoint_path=model_path, target_device=target).load_packed_params(params)
+        self.params = TVMCheckpoint(path=model_path, target_device=target).load_packed_params(params)
 
         # get functions
         self._f_create_kv_cache = self._vm["create_tir_paged_kv_cache"]
