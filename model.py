@@ -172,6 +172,7 @@ class AttentionBlock(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.sliding_window = config.sliding_window_size if layer_idx % 2 == 0 else 0
         self.rope_theta = config.rope_theta
+        self.rope_scaling = config.rope_scaling
 
         self.sinks = nn.Parameter((config.num_attention_heads,), dtype=dtype)
         self.norm = nn.RMSNorm(config.hidden_size, axes=-1, bias=False, dtype=dtype)
@@ -192,19 +193,9 @@ class AttentionBlock(nn.Module):
         positions: te.Tensor,
         rotary_dim: int,
         theta: float | tir.Var,
-        rope_scaling: dict[str, Any] | None = None,
+        rope_scaling: dict[str, Any],
     ):
         x_dtype = x.dtype
-        if rope_scaling is None:
-            rope_scaling = {
-                "rope_type": "yarn",
-                "rope_theta": float(self.rope_theta),
-                "factor": 32.0,
-                "beta_fast": 32.0,
-                "beta_slow": 1.0,
-                "truncate": False,
-                "original_max_position_embeddings": 4096,
-            }
 
         if isinstance(theta, tir.Var):
             theta = rope_scaling.get("rope_theta", self.rope_theta)
@@ -267,6 +258,7 @@ class AttentionBlock(nn.Module):
             self._rope,
             rotary_dim=self.config.head_dim,
             theta=self.rope_theta,
+            rope_scaling=self.rope_scaling,
         )
         q_embed = nn.op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
         k_embed = nn.op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
