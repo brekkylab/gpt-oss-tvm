@@ -1,7 +1,7 @@
 import dataclasses
 from functools import partial
 from math import log, pi, prod, sqrt
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Literal
 
 import mlc_llm.compiler_pass  # noqa: F401
 from mlc_llm import op as op_ext
@@ -11,31 +11,11 @@ from mlc_llm.support.config import ConfigBase
 from mlc_llm.support.style import bold
 from tvm import relax, te, tir
 from tvm.relax.frontend import nn
-from tvm.relax.frontend.nn import Tensor, op
 from tvm.script import tir as T
 
+from weights import FP4_VALUES
+
 logger = logging.getLogger(__name__)
-
-
-# TODO: TEMP location, please re-locate this
-FP4_VALUES = [
-    +0.0,
-    +0.5,
-    +1.0,
-    +1.5,
-    +2.0,
-    +3.0,
-    +4.0,
-    +6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-]
 
 
 def yarn_find_correction_dim(
@@ -163,7 +143,7 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, config: GPTOssConfig, layer_idx: int = 0, dtype: Optional[str] = None):
+    def __init__(self, config: GPTOssConfig, layer_idx: int = 0, dtype: str | None = None):
         assert config
         self.config = config
         if dtype is None:
@@ -174,6 +154,7 @@ class AttentionBlock(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.sliding_window = config.sliding_window_size if layer_idx % 2 == 0 else 0
         self.rope_theta = config.rope_theta
+        self.rope_scaling = config.rope_scaling
 
         self.sinks = nn.Parameter((config.num_attention_heads,), dtype=dtype)
         self.norm = nn.RMSNorm(config.hidden_size, axes=-1, bias=False, dtype=dtype)
@@ -193,20 +174,10 @@ class AttentionBlock(nn.Module):
         x: te.Tensor,
         positions: te.Tensor,
         rotary_dim: int,
-        theta: Union[float, tir.Var],
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        theta: float | tir.Var,
+        rope_scaling: dict[str, Any],
     ):
         x_dtype = x.dtype
-        if rope_scaling is None:
-            rope_scaling = {
-                # "rope_type": "yarn",
-                "rope_theta": float(self.rope_theta),
-                "factor": 32.0,
-                "beta_fast": 32.0,
-                "beta_slow": 1.0,
-                "truncate": False,
-                "original_max_position_embeddings": 4096,
-            }
 
         if isinstance(theta, tir.Var):
             theta = rope_scaling.get("rope_theta", self.rope_theta)
@@ -264,14 +235,15 @@ class AttentionBlock(nn.Module):
 
         return te.compute(x.shape, _rope_compute, name="yarn_rope")
 
-    def apply_rotation_to_qk(self, q: Tensor, k: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
+    def apply_rotation_to_qk(self, q: nn.Tensor, k: nn.Tensor, positions: nn.Tensor) -> tuple[nn.Tensor, nn.Tensor]:
         rope_ftn = partial(
             self._rope,
             rotary_dim=self.config.head_dim,
             theta=self.rope_theta,
+            rope_scaling=self.rope_scaling,
         )
-        q_embed = op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
-        k_embed = op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
+        q_embed = nn.op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
+        k_embed = nn.op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
 
         return q_embed, k_embed
 
@@ -344,14 +316,14 @@ class AttentionBlock(nn.Module):
         return x + t, paged_kv_cache
 
 
-def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16") -> Tensor:
+def swiglu(x: nn.Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16") -> nn.Tensor:
     shape = x.shape
     batch_shape = shape[:-1]
     last_dim = shape[-1]
     d = last_dim // 2
 
     # reshape: (..., 2 * d) -> (..., d, 2)
-    x_reshaped = op.reshape(x, (*batch_shape, d, 2))
+    x_reshaped = nn.op.reshape(x, (*batch_shape, d, 2))
 
     chunks = relax.op.split(x_reshaped._expr, indices_or_sections=2, axis=-1)
     chunk_glu = relax.TupleGetItem(chunks, 0)
@@ -363,16 +335,16 @@ def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str =
     x_linear_expr = relax.op.squeeze(chunk_linear, axis=-1)
     x_linear_expr = relax.op.astype(x_linear_expr, dtype=out_dtype)
 
-    alpha = op.wrap_nested(relax.const(alpha, dtype=out_dtype), name="alpha_const")
+    alpha = nn.op.wrap_nested(relax.const(alpha, dtype=out_dtype), name="alpha_const")
     limit_expr = relax.const(limit, dtype=out_dtype)
 
-    x_glu = op.wrap_nested(relax.op.minimum(x_glu_expr, limit_expr), name="x_glu_clip")
-    x_linear = op.wrap_nested(
+    x_glu = nn.op.wrap_nested(relax.op.minimum(x_glu_expr, limit_expr), name="x_glu_clip")
+    x_linear = nn.op.wrap_nested(
         relax.op.clip(x_linear_expr, min=-limit, max=limit),  # type: ignore
         name="x_linear_clip",
     )
 
-    gating = x_glu * op.sigmoid(alpha * x_glu)
+    gating = x_glu * nn.op.sigmoid(alpha * x_glu)
     output = gating * (x_linear + 1.0)
 
     return output
@@ -383,7 +355,7 @@ class MLPBlock(nn.Module):
         self,
         config: GPTOssConfig,
         rms_norm_eps: float = 1e-5,
-        dtype: Optional[str] = None,
+        dtype: str | None = None,
     ):
         """this block has the inner-dequantization of MXFP4 format weights"""
 
@@ -465,7 +437,7 @@ class MLPBlock(nn.Module):
         self,
         blocks: nn.Tensor,
         scales: nn.Tensor,
-        rows_per_chunk: Optional[int] = None,  # unused, kept for compatibility
+        rows_per_chunk: int | None = None,  # unused, kept for compatibility
     ) -> nn.Tensor:
         import numpy as np
 
@@ -559,7 +531,7 @@ class MLPBlock(nn.Module):
         expert_indices: nn.Tensor,
         weight_tensor: nn.Tensor,
         bias_tensor: nn.Tensor,
-        safetensor_dtype: Optional[str] = None,
+        safetensor_dtype: str | None = None,
     ) -> nn.Tensor:
         # input_dtype -> f32
         einsum_dtype = "float32"
@@ -624,7 +596,7 @@ class MLPBlock(nn.Module):
         self,
         input_tensor: nn.Tensor,
         expert_weights: nn.Tensor,
-        out_dtype: Optional[str] = None,
+        out_dtype: str | None = None,
     ):
         # f32 -> out_dtype
         seq_len, experts_per_token, out_features = input_tensor.shape
@@ -721,7 +693,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, config: GPTOssConfig, dtype: Optional[str] = None):
+    def __init__(self, config: GPTOssConfig, dtype: str | None = None):
         assert config
         if dtype is None:
             dtype = config.dtype
@@ -780,21 +752,21 @@ class GPTOssForCausalLM(nn.Module):
         # other setting
         self.sw_pattern = config.sliding_window_pattern
 
-    def to(self, dtype: Optional[str] = None):
+    def to(self, dtype: str | None = None):
         super().to(dtype=dtype)
         if dtype is not None:
             self.dtype = dtype
 
-    def _get_logits(self, hidden_states: Tensor) -> Tensor:
+    def _get_logits(self, hidden_states: nn.Tensor) -> nn.Tensor:
         logits = self.unembedding(hidden_states)
         if logits.dtype != "float32":
             logits = logits.astype("float32")
 
         return logits
 
-    def embed(self, input_ids: Tensor) -> Tensor:
+    def embed(self, input_ids: nn.Tensor) -> nn.Tensor:
         if self.tensor_parallel_shards > 1:
-            input_ids = op.ccl_broadcast_from_worker0(input_ids)
+            input_ids = nn.op.ccl_broadcast_from_worker0(input_ids)
         embed_ = self.model.embedding(input_ids)
 
         return nn.op.reshape(embed_, (1, -1, self.hidden_size))
