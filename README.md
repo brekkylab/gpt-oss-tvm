@@ -9,7 +9,11 @@ git submodule update --init --recursive
 ```
 
 #### Apply patches
-(currently, forked versions are used)
+```bash
+cd 3rdparty/mlc-llm/3rdparty/tvm
+git apply ../../../../tvm_fix.patch
+cd -
+```
 
 #### Build from source
 - [TVM](https://llm.mlc.ai/docs/install/mlc_llm.html#option-2-build-from-source)
