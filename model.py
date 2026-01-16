@@ -502,7 +502,7 @@ class MLPBlock(nn.Module):
         scales = scales.reshape(total_rows, 1)
 
         # Process multiple rows per block for better GPU utilization
-        rows_per_block = 8
+        rows_per_block = 64
         num_blocks = (total_rows + rows_per_block - 1) // rows_per_block
 
         @T.prim_func(private=True)
