@@ -78,7 +78,6 @@ def main(max_token_number: int = 64):
                 print("Got a stop token.")
                 break
 
-    print(generated_tokens)
     return decode_tokens(generated_tokens)
 
 
