@@ -125,7 +125,6 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     def __post_init__(self):
         if self.rope_scaling is None:
             self.rope_scaling = {
-                "rope_type": "yarn",
                 "rope_theta": float(self.rope_theta),
                 "factor": 32.0,  # in gpt-oss, `rope_scaling_factor`
                 "beta_fast": 32.0,  # in gpt-oss, `rope_ntk_beta`
