@@ -23,7 +23,7 @@ def get_input_tokens():
         [
             Message.from_role_and_content(
                 Role.SYSTEM,
-                SystemContent.new().with_model_identity("Your are ChatGPT, a large language model trained by OpenAI."),
+                SystemContent.new().with_model_identity("You are ChatGPT, a large language model trained by OpenAI."),
             ),
             Message.from_role_and_content(Role.USER, "What is 2 + 2?"),
         ]
@@ -67,14 +67,16 @@ def main(max_token_number: int = 64):
     generated_tokens.append(sampled_token)
 
     # decode stage
-    for _ in tqdm(range(max_token_number)):
-        token_tensor = np.array([sampled_token], dtype=np.int32)
-        decode_logits = engine.decode(token_tensor, seq_id)
-        sampled_token = engine.sample(decode_logits)
-        generated_tokens.append(sampled_token)
-        if sampled_token in stop_token_ids:
-            print("Got a stop token.")
-            break
+    with tqdm(range(max_token_number)) as progress_bar:
+        progress_bar.set_description("Generating tokens")
+        for _ in progress_bar:
+            token_tensor = np.array([sampled_token], dtype=np.int32)
+            decode_logits = engine.decode(token_tensor, seq_id)
+            sampled_token = engine.sample(decode_logits)
+            generated_tokens.append(sampled_token)
+            if sampled_token in stop_token_ids:
+                print("Got a stop token.")
+                break
 
     return decode_tokens(generated_tokens)
 
