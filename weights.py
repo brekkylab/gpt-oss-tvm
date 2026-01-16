@@ -93,11 +93,11 @@ class TVMCheckpoint:
                 tvm_params[name] = tvm_tensor
         return tvm_params
 
-    def get_tvm_tensor(self, name: str) -> tvm.runtime.Tensor:
+    def get_tvm_tensor(self, name: str) -> tvm_ffi.Tensor:
         assert name in self.tvm_params, f"Tensor {name} not found in TVM shard."
         return self.tvm_params[name]
 
-    def load_packed_params(self, params: list[tuple[str, nn.Parameter]]) -> list[tvm.runtime.Tensor]:
+    def load_packed_params(self, params: list[tuple[str, nn.Parameter]]) -> list[tvm_ffi.Tensor]:
         def convert_key(dict_key: str) -> str:
             replace_tuples = [
                 ("model.", ""),
