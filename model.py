@@ -11,7 +11,6 @@ from mlc_llm.support.config import ConfigBase
 from mlc_llm.support.style import bold
 from tvm import relax, te, tir
 from tvm.relax.frontend import nn
-from tvm.relax.frontend.nn import Tensor, op
 from tvm.script import tir as T
 
 from weights import FP4_VALUES
@@ -263,14 +262,14 @@ class AttentionBlock(nn.Module):
 
         return te.compute(x.shape, _rope_compute, name="yarn_rope")
 
-    def apply_rotation_to_qk(self, q: Tensor, k: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
+    def apply_rotation_to_qk(self, q: nn.Tensor, k: nn.Tensor, positions: nn.Tensor) -> tuple[nn.Tensor, nn.Tensor]:
         rope_ftn = partial(
             self._rope,
             rotary_dim=self.config.head_dim,
             theta=self.rope_theta,
         )
-        q_embed = op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
-        k_embed = op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
+        q_embed = nn.op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
+        k_embed = nn.op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
 
         return q_embed, k_embed
 
@@ -343,14 +342,14 @@ class AttentionBlock(nn.Module):
         return x + t, paged_kv_cache
 
 
-def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16") -> Tensor:
+def swiglu(x: nn.Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16") -> nn.Tensor:
     shape = x.shape
     batch_shape = shape[:-1]
     last_dim = shape[-1]
     d = last_dim // 2
 
     # reshape: (..., 2 * d) -> (..., d, 2)
-    x_reshaped = op.reshape(x, (*batch_shape, d, 2))
+    x_reshaped = nn.op.reshape(x, (*batch_shape, d, 2))
 
     chunks = relax.op.split(x_reshaped._expr, indices_or_sections=2, axis=-1)
     chunk_glu = relax.TupleGetItem(chunks, 0)
@@ -362,16 +361,16 @@ def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str =
     x_linear_expr = relax.op.squeeze(chunk_linear, axis=-1)
     x_linear_expr = relax.op.astype(x_linear_expr, dtype=out_dtype)
 
-    alpha = op.wrap_nested(relax.const(alpha, dtype=out_dtype), name="alpha_const")
+    alpha = nn.op.wrap_nested(relax.const(alpha, dtype=out_dtype), name="alpha_const")
     limit_expr = relax.const(limit, dtype=out_dtype)
 
-    x_glu = op.wrap_nested(relax.op.minimum(x_glu_expr, limit_expr), name="x_glu_clip")
-    x_linear = op.wrap_nested(
+    x_glu = nn.op.wrap_nested(relax.op.minimum(x_glu_expr, limit_expr), name="x_glu_clip")
+    x_linear = nn.op.wrap_nested(
         relax.op.clip(x_linear_expr, min=-limit, max=limit),  # type: ignore
         name="x_linear_clip",
     )
 
-    gating = x_glu * op.sigmoid(alpha * x_glu)
+    gating = x_glu * nn.op.sigmoid(alpha * x_glu)
     output = gating * (x_linear + 1.0)
 
     return output
@@ -784,16 +783,16 @@ class GPTOssForCausalLM(nn.Module):
         if dtype is not None:
             self.dtype = dtype
 
-    def _get_logits(self, hidden_states: Tensor) -> Tensor:
+    def _get_logits(self, hidden_states: nn.Tensor) -> nn.Tensor:
         logits = self.unembedding(hidden_states)
         if logits.dtype != "float32":
             logits = logits.astype("float32")
 
         return logits
 
-    def embed(self, input_ids: Tensor) -> Tensor:
+    def embed(self, input_ids: nn.Tensor) -> nn.Tensor:
         if self.tensor_parallel_shards > 1:
-            input_ids = op.ccl_broadcast_from_worker0(input_ids)
+            input_ids = nn.op.ccl_broadcast_from_worker0(input_ids)
         embed_ = self.model.embedding(input_ids)
 
         return nn.op.reshape(embed_, (1, -1, self.hidden_size))
