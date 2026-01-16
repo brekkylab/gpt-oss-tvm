@@ -501,6 +501,10 @@ class MLPBlock(nn.Module):
         blocks = blocks.reshape(total_rows, bytes_per_block)
         scales = scales.reshape(total_rows, 1)
 
+        # Process multiple rows per block for better GPU utilization
+        rows_per_block = 8
+        num_blocks = (total_rows + rows_per_block - 1) // rows_per_block
+
         @T.prim_func(private=True)
         def dequant_kernel(
             blocks_handle: T.handle,
@@ -514,20 +518,49 @@ class MLPBlock(nn.Module):
             lut_buf = T.match_buffer(lut_handle, (16,), out_dtype)
             out_buf = T.match_buffer(out_handle, (total_rows, 2 * bytes_per_block), out_dtype)
 
+            # Shared memory for LUT (16 values) and cached exp2 scales (per row)
+            lut_shared = T.alloc_buffer((16,), out_dtype, scope="shared")
+            scale_shared = T.alloc_buffer((rows_per_block,), "float32", scope="shared")
+
             with T.block("init_dequantize"):
-                for i in T.thread_binding(total_rows, thread="blockIdx.x"):
-                    for j in T.thread_binding(bytes_per_block, thread="threadIdx.x"):
+                for block_idx in T.thread_binding(num_blocks, thread="blockIdx.x"):
+                    for local_idx in T.thread_binding(rows_per_block * bytes_per_block, thread="threadIdx.x"):
+                        # Load LUT into shared memory (first 16 threads)
+                        with T.block("load_lut"):
+                            vblock, vlocal = T.axis.remap("SS", [block_idx, local_idx])
+                            if vlocal < 16:
+                                lut_shared[vlocal] = lut_buf[vlocal]
+
+                        # Load and compute exp2 scales into shared memory (one per row)
+                        with T.block("load_scales"):
+                            vblock, vlocal = T.axis.remap("SS", [block_idx, local_idx])
+                            local_row = vlocal // bytes_per_block
+                            is_first_in_row = (vlocal % bytes_per_block) == 0
+                            vi = vblock * rows_per_block + local_row
+                            if is_first_in_row and vi < total_rows:
+                                exp_val = scales_buf[vi, 0]
+                                scale_shared[local_row] = T.exp2(T.cast(exp_val, "float32"))
+
+                        # Sync threads to ensure shared memory is populated
+                        with T.block("sync"):
+                            T.evaluate(0)
+
+                        # Main dequantization using shared memory
                         with T.block("run_dequantize"):
-                            vi, vj = T.axis.remap("SS", [i, j])
-                            block_val = blocks_buf[vi, vj]
-                            exp_val = scales_buf[vi, 0]
+                            vblock, vlocal = T.axis.remap("SS", [block_idx, local_idx])
+                            local_row = vlocal // bytes_per_block
+                            vj = vlocal % bytes_per_block
+                            vi = vblock * rows_per_block + local_row
 
-                            idx_low = T.cast(block_val & T.uint8(0x0F), "int64")
-                            idx_high = T.cast(block_val >> T.uint8(4), "int64")
+                            if vi < total_rows:
+                                block_val = blocks_buf[vi, vj]
+                                ldexp_scale = scale_shared[local_row]
 
-                            ldexp_scale = T.exp2(T.cast(exp_val, "float32"))
-                            out_buf[vi, 2 * vj] = lut_buf[idx_low] * ldexp_scale
-                            out_buf[vi, 2 * vj + 1] = lut_buf[idx_high] * ldexp_scale
+                                idx_low = T.cast(block_val & T.uint8(0x0F), "int64")
+                                idx_high = T.cast(block_val >> T.uint8(4), "int64")
+
+                                out_buf[vi, 2 * vj] = lut_shared[idx_low] * ldexp_scale
+                                out_buf[vi, 2 * vj + 1] = lut_shared[idx_high] * ldexp_scale
 
         out = nn.tensor_ir_op(
             dequant_kernel,
@@ -580,20 +613,20 @@ class MLPBlock(nn.Module):
                 with T.block("compute_matmul"):
                     # S for spatial axis in the argument `kinds`
                     seq_idx, expert_rank, out_idx = T.axis.remap("SSS", [s, r, c])
-                    # e_idx = e_indices[seq_idx, expert_rank]
+                    e_idx = e_indices[seq_idx, expert_rank]
 
                     sum_buffer = T.alloc_buffer((1,), dtype=einsum_dtype, scope="local")
-                    sum_buffer[0] = T.cast(bias[e_indices[seq_idx, expert_rank], out_idx], einsum_dtype)
+                    sum_buffer[0] = T.cast(bias[e_idx, out_idx], einsum_dtype)
 
                     for in_idx in T.serial(in_features):
                         if input_is_3d:
                             sum_buffer[0] += T.cast(x[seq_idx, expert_rank, in_idx], einsum_dtype) * T.cast(
-                                weight[e_indices[seq_idx, expert_rank], out_idx, in_idx],
+                                weight[e_idx, out_idx, in_idx],
                                 einsum_dtype,
                             )
                         else:
                             sum_buffer[0] += T.cast(x[seq_idx, in_idx], einsum_dtype) * T.cast(
-                                weight[e_indices[seq_idx, expert_rank], out_idx, in_idx],
+                                weight[e_idx, out_idx, in_idx],
                                 einsum_dtype,
                             )
                     out[seq_idx, expert_rank, out_idx] = sum_buffer[0]
