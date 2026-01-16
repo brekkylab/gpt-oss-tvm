@@ -78,8 +78,8 @@ def rope_freq_yarn(
 class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     """Configuration of the gpt-oss model."""
 
-    context_window_size: int = 40960
-    prefill_chunk_size: int = 0
+    context_window_size: int = 0
+    prefill_chunk_size: int = 8192
     tensor_parallel_shards: int = 1
     pipeline_parallel_stages: int = 1
     dtype: str = "bfloat16"
@@ -95,7 +95,7 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     num_attention_heads: int = 64
     num_key_value_heads: int = 8
     sliding_window_size: int = 128
-    rope_theta: int | float = 150000
+    rope_theta: int | float = 150_000
     rope_scaling: dict | None = None
     swiglu_limit: float = 7.0
 
@@ -105,7 +105,6 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     def __post_init__(self):
         if self.rope_scaling is None:
             self.rope_scaling = {
-                # "rope_type": "yarn",
                 "rope_theta": float(self.rope_theta),
                 "factor": 32.0,  # in gpt-oss, `rope_scaling_factor`
                 "beta_fast": 32.0,  # in gpt-oss, `rope_ntk_beta`
@@ -114,12 +113,11 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
                 "original_max_position_embeddings": 4096,  # in gpt-oss, `initial_context_length`
             }
 
-        if "quantization_config" in self.kwargs:
-            quantization_config = self.kwargs.get("quantization_config")
-            # FIXME(if needed)
-            pass
+        assert self.num_attention_heads > 0
+        assert self.num_key_value_heads > 0
+        assert self.head_dim > 0
+        assert self.num_attention_heads % self.num_key_value_heads == 0
 
-        # context_window_size = 40960, fixed
         if self.context_window_size == 0:
             for name in ["max_position_embeddings", "max_sequence_length"]:
                 if name in self.kwargs:
@@ -131,33 +129,17 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
                         self.context_window_size,
                     )
                     break
-            else:
-                raise ValueError(
-                    "Unable to determine the maximum sequence length, because none of "
-                    "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
-                    "provided in `config.json`."
-                )
-            if self.num_key_value_heads == 0:
-                self.num_key_value_heads = self.num_attention_heads
-            if self.head_dim == 0:
-                self.head_dim = self.hidden_size // self.num_attention_heads
-            assert self.num_attention_heads % self.num_key_value_heads == 0
-            # TODO: need to check `8192`; to another value
-            if self.prefill_chunk_size == 0:
-                self.prefill_chunk_size = min(self.context_window_size, 8192)
-                logger.info(
-                    "%s defaults to %d",
-                    bold("prefill_chunk_size"),
-                    self.prefill_chunk_size,
-                )
-            elif self.prefill_chunk_size > self.context_window_size:
-                logger.info(
-                    "Overriding %s from %d to %d",
-                    bold("prefill_chunk_size"),
-                    self.prefill_chunk_size,
-                    min(self.context_window_size, 8192),
-                )
-                self.prefill_chunk_size = min(self.context_window_size, 8192)
+        else:
+            # model originally supports 131_072(128k), but default value is capped to 40k.
+            self.context_window_size = 40960
+            logger.info(
+                "Unable to determine the maximum sequence length, because none of "
+                "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
+                "provided in `config.json`. So it is set to the default value %d.",
+                self.context_window_size,
+            )
+
+        self.prefill_chunk_size = min(self.context_window_size, self.prefill_chunk_size)
 
 
 class AttentionBlock(nn.Module):
