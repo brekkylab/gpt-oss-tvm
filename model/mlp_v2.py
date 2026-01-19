@@ -1,5 +1,6 @@
 from typing import Optional
 
+import numpy as np
 from mlc_llm.op.moe_matmul import gemv
 from mlc_llm.op.moe_misc import (
     gating_softmax_topk,
@@ -89,16 +90,6 @@ class MLPBlock(nn.Module):
         self.mlp1_bias = nn.Parameter((self.num_experts, self.intermediate_size * 2), dtype=dtype)
         self.mlp2_bias = nn.Parameter((self.num_experts, self.hidden_size), dtype=dtype)
 
-        # Gating indptr for decode-mode gemv optimization
-        import numpy as np
-
-        self.gate_indptr = nn.Tensor.from_const(np.arange(self.num_experts, dtype="int32").reshape(1, self.num_experts))
-
-    def get_lut(self, dtype):
-        import numpy as np
-
-        return nn.Tensor.from_const(np.array(FP4_VALUES, dtype="float32")).astype(dtype)
-
     def forward(self, x: nn.Tensor) -> nn.Tensor:
         b, s, h = x.shape
         num_tokens = b * s
@@ -118,45 +109,11 @@ class MLPBlock(nn.Module):
             return self.forward_decode(x, t, b, s, h)
         return self.forward_prefill(x, t, b, s, h, num_tokens)
 
-    def forward_decode(self, x, t, b, s, h):
-        k = self.experts_per_token
-        num_experts = self.num_experts
-        lut = self.get_lut("float32")
-
-        # Step 0: Gating using optimized gemv
-        # w_gate: (num_experts, 1, h), t: (1, h) -> out: (num_experts, 1)
-        g = gemv(t, self.gate.weight.reshape(self.num_experts, 1, h), self.gate_indptr)
-        g = g.reshape(1, self.num_experts)
-        if self.gate.bias is not None:
-            g = op.add(g, self.gate.bias.reshape(1, num_experts))
-
-        expert_weights, expert_indices = gating_softmax_topk(g, k)
-
-        token_expert_ids = expert_indices.reshape(k)
-        x_sorted = op.broadcast_to(t, [k, h])
-
-        # Step 1: Expert-Parallel MLP1 (v17 style) - Proven Correct and Fast
-        x_intermediate = self.mxfp4_decode_mlp1_v20(
-            x_sorted, self.mlp1_weight_blocks, self.mlp1_weight_scales, self.mlp1_bias, token_expert_ids, lut
-        )
-        # Step 2: Expert-Parallel MLP2 (v17 style) - Proven Correct and Fast
-        x_expert_out = self.mxfp4_decode_mlp2_v20(
-            x_intermediate, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias, token_expert_ids, lut
-        )
-
-        # Step 3: Weighted Average across experts using gemv (from moe_matmul)
-        # (1, k) @ (k, h) -> (1, h)
-        w_sum = x_expert_out.permute_dims(1, 0).reshape(1, h, k)
-        indptr_sum = op.full([1, 1], 0, dtype="int32")
-        res = gemv(expert_weights.astype("float32"), w_sum, indptr_sum)
-
-        return x + res.reshape(b, s, h).astype(self.dtype)
-
     def forward_prefill(self, x, t, b, s, h, num_tokens):
         g = self.gate(t)
         k = self.experts_per_token
         num_experts = self.num_experts
-        lut = self.get_lut("float32")
+        lut = nn.Tensor.from_const(np.array(FP4_VALUES, dtype="float32"))
 
         expert_weights, expert_indices = nn.op.topk(g, k=k, axis=-1, largest=True)
         expert_weights = nn.op.softmax(expert_weights, axis=1)
@@ -192,10 +149,10 @@ class MLPBlock(nn.Module):
         )
 
         x_sorted = op.take(t, token_indices, axis=0)
-        x_sorted = self.mxfp4_moe_mlp1(
+        x_sorted = self.mxfp4_moe_mlp1_prefill(
             x_sorted, self.mlp1_weight_blocks, self.mlp1_weight_scales, self.mlp1_bias, token_expert_ids, lut
         )
-        x_sorted = self.mxfp4_moe_mlp2(
+        x_sorted = self.mxfp4_moe_mlp2_prefill(
             x_sorted, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias, token_expert_ids, lut
         )
         x_scattered = scatter_output(x_sorted, rev_indices).reshape(num_tokens, k, h)
@@ -204,147 +161,48 @@ class MLPBlock(nn.Module):
 
         return x + res
 
-    def mxfp4_decode_mlp1_v20(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
-        (E, group_size, B_L, out_features) = blocks.shape
-        N = out_features // 2
+    def forward_decode(self, x, t, b, s, h):
+        k = self.experts_per_token
+        num_experts = self.num_experts
+        lut = nn.Tensor.from_const(np.array(FP4_VALUES, dtype="float32"))
 
-        @T.prim_func(private=True)
-        def _func_mlp1_spec(
-            var_x: T.handle,
-            var_b: T.handle,
-            var_s: T.handle,
-            var_bias: T.handle,
-            var_e: T.handle,
-            var_lut: T.handle,
-            var_o: T.handle,
-        ):
-            T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
-            x_buf = T.match_buffer(var_x, (4, 2880), self.dtype)
-            blocks_buf = T.match_buffer(var_b, (E, group_size, B_L, out_features), "uint8")
-            scales_buf = T.match_buffer(var_s, (E, group_size, out_features), "uint8")
-            bias_buf = T.match_buffer(var_bias, (E, out_features), self.dtype)
-            e_ids_buf = T.match_buffer(var_e, (4,), "int32")
-            lut_buf = T.match_buffer(var_lut, (16,), "float32")
-            out_buf = T.match_buffer(var_o, (4, N), "float32")
-            for vj_b in T.thread_binding((N + 127) // 128, thread="blockIdx.x"):
-                for vi_b in T.thread_binding(4, thread="blockIdx.y"):
-                    for vj_t in T.thread_binding(128, thread="threadIdx.x"):
-                        with T.block("compute"):
-                            vj = vj_b * 128 + vj_t
-                            x_sh = T.alloc_buffer((2, 32), "float32", scope="shared")
-                            lut_sh = T.alloc_buffer((16,), "float32", scope="shared")
-                            acc_g = T.alloc_buffer((1,), "float32", scope="local")
-                            acc_l = T.alloc_buffer((1,), "float32", scope="local")
-                            if vj_t < 16:
-                                lut_sh[vj_t] = lut_buf[vj_t]
-                            eid = e_ids_buf[vi_b]
-                            if vj < N:
-                                acc_g[0] = T.cast(bias_buf[eid, vj * 2], "float32")
-                                acc_l[0] = T.cast(bias_buf[eid, vj * 2 + 1], "float32")
-                            else:
-                                acc_g[0] = 0.0
-                                acc_l[0] = 0.0
-                            if vj_t < 32:
-                                x_sh[0, vj_t] = T.cast(x_buf[vi_b, vj_t], "float32")
-                            T.tvm_storage_sync("shared")
-                            for g in T.serial(group_size):
-                                if g + 1 < group_size:
-                                    if vj_t < 32:
-                                        x_sh[(g + 1) % 2, vj_t] = T.cast(x_buf[vi_b, (g + 1) * 32 + vj_t], "float32")
-                                if vj < N:
-                                    sg = T.exp2(T.cast(T.cast(scales_buf[eid, g, vj * 2], "int32") - 127, "float32"))
-                                    sl = T.exp2(
-                                        T.cast(T.cast(scales_buf[eid, g, vj * 2 + 1], "int32") - 127, "float32")
-                                    )
-                                    for b in T.unroll(B_L):
-                                        bk_g = blocks_buf[eid, g, b, vj * 2]
-                                        bk_l = blocks_buf[eid, g, b, vj * 2 + 1]
-                                        w0g = lut_sh[T.cast(bk_g & T.uint8(0x0F), "int32")]
-                                        w1g = lut_sh[T.cast(bk_g >> T.uint8(4), "int32")]
-                                        w0l = lut_sh[T.cast(bk_l & T.uint8(0x0F), "int32")]
-                                        w1l = lut_sh[T.cast(bk_l >> T.uint8(4), "int32")]
-                                        xx0, xx1 = x_sh[g % 2, b * 2], x_sh[g % 2, b * 2 + 1]
-                                        acc_g[0] = acc_g[0] + (xx0 * w0g + xx1 * w1g) * sg
-                                        acc_l[0] = acc_l[0] + (xx0 * w0l + xx1 * w1l) * sl
-                                T.tvm_storage_sync("shared")
-                            if vj < N:
-                                xg = T.min(acc_g[0], T.float32(self.swiglu_limit))
-                                xl = T.max(T.min(acc_l[0], T.float32(7.0)), T.float32(-7.0))
-                                gv = xg / (T.float32(1.0) + T.exp(-T.float32(1.702) * xg))
-                                out_buf[vi_b, vj] = gv * (xl + T.float32(1.0))
+        # Step 0: Gating using optimized gemv
+        # w_gate: (num_experts, 1, h), t: (1, h) -> out: (num_experts, 1)
+        gate_indptr = nn.Tensor.from_const(np.arange(self.num_experts, dtype="int32").reshape(1, self.num_experts))
+        g = gemv(t, self.gate.weight.reshape(self.num_experts, 1, h), gate_indptr)
+        g = g.reshape(1, self.num_experts)
+        if self.gate.bias is not None:
+            g = op.add(g, self.gate.bias.reshape(1, num_experts))
 
-        return nn.tensor_ir_op(
-            _func_mlp1_spec,
-            "mxfp4_decode_mlp1_v20",
-            args=[x, blocks, scales, bias, token_expert_ids, lut],
-            out=Tensor.placeholder([4, N], "float32"),
+        expert_weights, expert_indices = gating_softmax_topk(g, k)
+
+        token_expert_ids = expert_indices.reshape(k)
+        x_sorted = op.broadcast_to(t, [k, h])
+
+        # Step 1: Expert-Parallel MLP1
+        x_intermediate = self.mxfp4_moe_mlp1_decode(
+            x_sorted, self.mlp1_weight_blocks, self.mlp1_weight_scales, self.mlp1_bias, token_expert_ids, lut
+        )
+        # Step 2: Expert-Parallel MLP2
+        x_expert_out = self.mxfp4_moe_mlp2_decode(
+            x_intermediate, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias, token_expert_ids, lut
         )
 
-    def mxfp4_decode_mlp2_v20(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
-        (E, group_size, B_L, N) = blocks.shape
+        # Step 3: Weighted Average across experts using gemv
+        # (1, k) @ (k, h) -> (1, h)
+        w_sum = x_expert_out.permute_dims(1, 0).reshape(1, h, k)
+        indptr_sum = op.full([1, 1], 0, dtype="int32")
+        res = gemv(expert_weights.astype("float32"), w_sum, indptr_sum)
 
-        @T.prim_func(private=True)
-        def _func_mlp2_spec(
-            var_x: T.handle,
-            var_b: T.handle,
-            var_s: T.handle,
-            var_bias: T.handle,
-            var_e: T.handle,
-            var_lut: T.handle,
-            var_o: T.handle,
-        ):
-            T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
-            x_buf = T.match_buffer(var_x, (4, 2880), "float32")
-            blocks_buf = T.match_buffer(var_b, (E, group_size, B_L, N), "uint8")
-            scales_buf = T.match_buffer(var_s, (E, group_size, N), "uint8")
-            bias_buf = T.match_buffer(var_bias, (E, N), self.dtype)
-            e_ids_buf = T.match_buffer(var_e, (4,), "int32")
-            lut_buf = T.match_buffer(var_lut, (16,), "float32")
-            out_buf = T.match_buffer(var_o, (4, N), "float32")
-            for vj_b in T.thread_binding((N + 127) // 128, thread="blockIdx.x"):
-                for vi_b in T.thread_binding(4, thread="blockIdx.y"):
-                    for vj_t in T.thread_binding(128, thread="threadIdx.x"):
-                        with T.block("compute"):
-                            vj = vj_b * 128 + vj_t
-                            x_sh = T.alloc_buffer((2, 32), "float32", scope="shared")
-                            lut_sh = T.alloc_buffer((16,), "float32", scope="shared")
-                            acc = T.alloc_buffer((1,), "float32", scope="local")
-                            if vj_t < 16:
-                                lut_sh[vj_t] = lut_buf[vj_t]
-                            eid = e_ids_buf[vi_b]
-                            acc[0] = T.cast(bias_buf[eid, vj], "float32") if vj < N else 0.0
-                            if vj_t < 32:
-                                x_sh[0, vj_t] = x_buf[vi_b, vj_t]
-                            T.tvm_storage_sync("shared")
-                            for g in T.serial(group_size):
-                                if g + 1 < group_size:
-                                    if vj_t < 32:
-                                        x_sh[(g + 1) % 2, vj_t] = x_buf[vi_b, (g + 1) * 32 + vj_t]
-                                if vj < N:
-                                    sc = T.exp2(T.cast(T.cast(scales_buf[eid, g, vj], "int32") - 127, "float32"))
-                                    for b in T.unroll(B_L):
-                                        bk = blocks_buf[eid, g, b, vj]
-                                        w0 = lut_sh[T.cast(bk & T.uint8(0x0F), "int32")]
-                                        w1 = lut_sh[T.cast(bk >> T.uint8(4), "int32")]
-                                        acc[0] = acc[0] + (x_sh[g % 2, b * 2] * w0 + x_sh[g % 2, b * 2 + 1] * w1) * sc
-                                T.tvm_storage_sync("shared")
-                            if vj < N:
-                                out_buf[vi_b, vj] = acc[0]
+        return x + res.reshape(b, s, h).astype(self.dtype)
 
-        return nn.tensor_ir_op(
-            _func_mlp2_spec,
-            "mxfp4_decode_mlp2_v20",
-            args=[x, blocks, scales, bias, token_expert_ids, lut],
-            out=Tensor.placeholder([4, N], "float32"),
-        )
-
-    def mxfp4_moe_mlp1(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
+    def mxfp4_moe_mlp1_prefill(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
         (E, group_size, B_L, out_features) = blocks.shape
         B_val_outer = x.shape[0]
         N = out_features // 2
 
         @T.prim_func(private=True)
-        def _func_mlp1(
+        def _func(
             var_x: T.handle,
             var_b: T.handle,
             var_s: T.handle,
@@ -355,7 +213,7 @@ class MLPBlock(nn.Module):
         ):
             B_val = T.int32(is_size_var=True)
             T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
-            x_buf = T.match_buffer(var_x, (B_val, 2880), x.dtype)
+            x_buf = T.match_buffer(var_x, (B_val, self.hidden_size), x.dtype)
             blocks_buf = T.match_buffer(var_b, (E, group_size, B_L, out_features), "uint8")
             scales_buf = T.match_buffer(var_s, (E, group_size, out_features), "uint8")
             bias_buf = T.match_buffer(var_bias, (E, out_features), bias.dtype)
@@ -429,18 +287,18 @@ class MLPBlock(nn.Module):
                                     out_buf[vi_b * 4 + t, vj] = gv * (xl + T.float32(1.0))
 
         return op.tensor_ir_op(
-            _func_mlp1,
-            "mxfp4_moe_mlp1",
+            _func,
+            "mxfp4_moe_mlp1_prefill",
             args=[x, blocks, scales, bias, token_expert_ids, lut],
             out=Tensor.placeholder([B_val_outer, N], "float32"),
         )
 
-    def mxfp4_moe_mlp2(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
+    def mxfp4_moe_mlp2_prefill(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
         (E, group_size, B_L, N) = blocks.shape
         B_val_outer = x.shape[0]
 
         @T.prim_func(private=True)
-        def _func_mlp2(
+        def _func(
             var_x: T.handle,
             var_b: T.handle,
             var_s: T.handle,
@@ -451,7 +309,7 @@ class MLPBlock(nn.Module):
         ):
             B_val = T.int32(is_size_var=True)
             T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
-            x_buf = T.match_buffer(var_x, (B_val, 2880), "float32")
+            x_buf = T.match_buffer(var_x, (B_val, self.hidden_size), "float32")
             blocks_buf = T.match_buffer(var_b, (E, group_size, B_L, N), "uint8")
             scales_buf = T.match_buffer(var_s, (E, group_size, N), "uint8")
             bias_buf = T.match_buffer(var_bias, (E, N), bias.dtype)
@@ -505,8 +363,142 @@ class MLPBlock(nn.Module):
                                     out_buf[vi_b * 4 + t, vj] = acc[t]
 
         return op.tensor_ir_op(
-            _func_mlp2,
-            "mxfp4_moe_mlp2",
+            _func,
+            "mxfp4_moe_mlp2_prefill",
             args=[x, blocks, scales, bias, token_expert_ids, lut],
             out=Tensor.placeholder([B_val_outer, N], "float32"),
+        )
+
+    def mxfp4_moe_mlp1_decode(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
+        (E, group_size, B_L, out_features) = blocks.shape
+        N = out_features // 2
+
+        @T.prim_func(private=True)
+        def _func(
+            var_x: T.handle,
+            var_b: T.handle,
+            var_s: T.handle,
+            var_bias: T.handle,
+            var_e: T.handle,
+            var_lut: T.handle,
+            var_o: T.handle,
+        ):
+            T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
+            x_buf = T.match_buffer(var_x, (4, self.hidden_size), self.dtype)
+            blocks_buf = T.match_buffer(var_b, (E, group_size, B_L, out_features), "uint8")
+            scales_buf = T.match_buffer(var_s, (E, group_size, out_features), "uint8")
+            bias_buf = T.match_buffer(var_bias, (E, out_features), self.dtype)
+            e_ids_buf = T.match_buffer(var_e, (4,), "int32")
+            lut_buf = T.match_buffer(var_lut, (16,), "float32")
+            out_buf = T.match_buffer(var_o, (4, N), "float32")
+            for vj_b in T.thread_binding((N + 127) // 128, thread="blockIdx.x"):
+                for vi_b in T.thread_binding(4, thread="blockIdx.y"):
+                    for vj_t in T.thread_binding(128, thread="threadIdx.x"):
+                        with T.block("compute"):
+                            vj = vj_b * 128 + vj_t
+                            x_sh = T.alloc_buffer((2, 32), "float32", scope="shared")
+                            lut_sh = T.alloc_buffer((16,), "float32", scope="shared")
+                            acc_g = T.alloc_buffer((1,), "float32", scope="local")
+                            acc_l = T.alloc_buffer((1,), "float32", scope="local")
+                            if vj_t < 16:
+                                lut_sh[vj_t] = lut_buf[vj_t]
+                            eid = e_ids_buf[vi_b]
+                            if vj < N:
+                                acc_g[0] = T.cast(bias_buf[eid, vj * 2], "float32")
+                                acc_l[0] = T.cast(bias_buf[eid, vj * 2 + 1], "float32")
+                            else:
+                                acc_g[0] = 0.0
+                                acc_l[0] = 0.0
+                            if vj_t < 32:
+                                x_sh[0, vj_t] = T.cast(x_buf[vi_b, vj_t], "float32")
+                            T.tvm_storage_sync("shared")
+                            for g in T.serial(group_size):
+                                if g + 1 < group_size:
+                                    if vj_t < 32:
+                                        x_sh[(g + 1) % 2, vj_t] = T.cast(x_buf[vi_b, (g + 1) * 32 + vj_t], "float32")
+                                if vj < N:
+                                    sg = T.exp2(T.cast(T.cast(scales_buf[eid, g, vj * 2], "int32") - 127, "float32"))
+                                    sl = T.exp2(
+                                        T.cast(T.cast(scales_buf[eid, g, vj * 2 + 1], "int32") - 127, "float32")
+                                    )
+                                    for b in T.unroll(B_L):
+                                        bk_g = blocks_buf[eid, g, b, vj * 2]
+                                        bk_l = blocks_buf[eid, g, b, vj * 2 + 1]
+                                        w0g = lut_sh[T.cast(bk_g & T.uint8(0x0F), "int32")]
+                                        w1g = lut_sh[T.cast(bk_g >> T.uint8(4), "int32")]
+                                        w0l = lut_sh[T.cast(bk_l & T.uint8(0x0F), "int32")]
+                                        w1l = lut_sh[T.cast(bk_l >> T.uint8(4), "int32")]
+                                        xx0, xx1 = x_sh[g % 2, b * 2], x_sh[g % 2, b * 2 + 1]
+                                        acc_g[0] = acc_g[0] + (xx0 * w0g + xx1 * w1g) * sg
+                                        acc_l[0] = acc_l[0] + (xx0 * w0l + xx1 * w1l) * sl
+                                T.tvm_storage_sync("shared")
+                            if vj < N:
+                                xg = T.min(acc_g[0], T.float32(self.swiglu_limit))
+                                xl = T.max(T.min(acc_l[0], T.float32(7.0)), T.float32(-7.0))
+                                gv = xg / (T.float32(1.0) + T.exp(-T.float32(1.702) * xg))
+                                out_buf[vi_b, vj] = gv * (xl + T.float32(1.0))
+
+        return nn.tensor_ir_op(
+            _func,
+            "mxfp4_moe_mlp1_decode",
+            args=[x, blocks, scales, bias, token_expert_ids, lut],
+            out=Tensor.placeholder([4, N], "float32"),
+        )
+
+    def mxfp4_moe_mlp2_decode(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
+        (E, group_size, B_L, N) = blocks.shape
+
+        @T.prim_func(private=True)
+        def _func(
+            var_x: T.handle,
+            var_b: T.handle,
+            var_s: T.handle,
+            var_bias: T.handle,
+            var_e: T.handle,
+            var_lut: T.handle,
+            var_o: T.handle,
+        ):
+            T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
+            x_buf = T.match_buffer(var_x, (4, self.hidden_size), "float32")
+            blocks_buf = T.match_buffer(var_b, (E, group_size, B_L, N), "uint8")
+            scales_buf = T.match_buffer(var_s, (E, group_size, N), "uint8")
+            bias_buf = T.match_buffer(var_bias, (E, N), self.dtype)
+            e_ids_buf = T.match_buffer(var_e, (4,), "int32")
+            lut_buf = T.match_buffer(var_lut, (16,), "float32")
+            out_buf = T.match_buffer(var_o, (4, N), "float32")
+            for vj_b in T.thread_binding((N + 127) // 128, thread="blockIdx.x"):
+                for vi_b in T.thread_binding(4, thread="blockIdx.y"):
+                    for vj_t in T.thread_binding(128, thread="threadIdx.x"):
+                        with T.block("compute"):
+                            vj = vj_b * 128 + vj_t
+                            x_sh = T.alloc_buffer((2, 32), "float32", scope="shared")
+                            lut_sh = T.alloc_buffer((16,), "float32", scope="shared")
+                            acc = T.alloc_buffer((1,), "float32", scope="local")
+                            if vj_t < 16:
+                                lut_sh[vj_t] = lut_buf[vj_t]
+                            eid = e_ids_buf[vi_b]
+                            acc[0] = T.cast(bias_buf[eid, vj], "float32") if vj < N else 0.0
+                            if vj_t < 32:
+                                x_sh[0, vj_t] = x_buf[vi_b, vj_t]
+                            T.tvm_storage_sync("shared")
+                            for g in T.serial(group_size):
+                                if g + 1 < group_size:
+                                    if vj_t < 32:
+                                        x_sh[(g + 1) % 2, vj_t] = x_buf[vi_b, (g + 1) * 32 + vj_t]
+                                if vj < N:
+                                    sc = T.exp2(T.cast(T.cast(scales_buf[eid, g, vj], "int32") - 127, "float32"))
+                                    for b in T.unroll(B_L):
+                                        bk = blocks_buf[eid, g, b, vj]
+                                        w0 = lut_sh[T.cast(bk & T.uint8(0x0F), "int32")]
+                                        w1 = lut_sh[T.cast(bk >> T.uint8(4), "int32")]
+                                        acc[0] = acc[0] + (x_sh[g % 2, b * 2] * w0 + x_sh[g % 2, b * 2 + 1] * w1) * sc
+                                T.tvm_storage_sync("shared")
+                            if vj < N:
+                                out_buf[vi_b, vj] = acc[0]
+
+        return nn.tensor_ir_op(
+            _func,
+            "mxfp4_moe_mlp2_decode",
+            args=[x, blocks, scales, bias, token_expert_ids, lut],
+            out=Tensor.placeholder([4, N], "float32"),
         )
