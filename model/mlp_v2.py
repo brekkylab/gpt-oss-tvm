@@ -1,6 +1,8 @@
 from typing import Optional
 
+from mlc_llm.op.moe_matmul import gemv
 from mlc_llm.op.moe_misc import (
+    gating_softmax_topk,
     get_indices,
     get_indptr,
     moe_cumsum,
@@ -87,6 +89,11 @@ class MLPBlock(nn.Module):
         self.mlp1_bias = nn.Parameter((self.num_experts, self.intermediate_size * 2), dtype=dtype)
         self.mlp2_bias = nn.Parameter((self.num_experts, self.hidden_size), dtype=dtype)
 
+        # Gating indptr for decode-mode gemv optimization
+        import numpy as np
+
+        self.gate_indptr = nn.Tensor.from_const(np.arange(self.num_experts, dtype="int32").reshape(1, self.num_experts))
+
     def get_lut(self, dtype):
         import numpy as np
 
@@ -97,14 +104,9 @@ class MLPBlock(nn.Module):
         num_tokens = b * s
         x_reshaped = x.reshape(num_tokens, h)
         t = self.norm(x_reshaped)
-        g = self.gate(t)
         k = self.experts_per_token
         num_experts = self.num_experts
         lut = self.get_lut("float32")
-
-        expert_weights, expert_indices = nn.op.topk(g, k=k, axis=-1, largest=True)
-        expert_weights = nn.op.softmax(expert_weights, axis=1)
-        expert_indices = expert_indices.astype("int32")
 
         # ROBUST HIGH-PERFORMANCE DECODE PATH (B=1 optimization)
         is_decode = False
@@ -116,6 +118,15 @@ class MLPBlock(nn.Module):
                 is_decode = True
 
         if is_decode:
+            # Step 0: Gating using optimized gemv
+            # w_gate: (num_experts, 1, h), t: (1, h) -> out: (num_experts, 1)
+            g = gemv(t, self.gate.weight.reshape(self.num_experts, 1, h), self.gate_indptr)
+            g = g.reshape(1, self.num_experts)
+            if self.gate.bias is not None:
+                g = op.add(g, self.gate.bias.reshape(1, num_experts))
+
+            expert_weights, expert_indices = gating_softmax_topk(g, k)
+
             token_expert_ids = expert_indices.reshape(k)
             x_sorted = op.broadcast_to(t, [k, h])
 
@@ -128,12 +139,19 @@ class MLPBlock(nn.Module):
                 x_intermediate, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias, token_expert_ids, lut
             )
 
-            # Step 3: Precise Weighted Average across experts
+            # Step 3: Weighted Average across experts using gemv (from moe_matmul)
             # (1, k) @ (k, h) -> (1, h)
-            res = op.matmul(expert_weights.astype("float32"), x_expert_out)
+            w_sum = x_expert_out.permute_dims(1, 0).reshape(1, h, k)
+            indptr_sum = op.full([1, 1], 0, dtype="int32")
+            res = gemv(expert_weights.astype("float32"), w_sum, indptr_sum)
+
             return x + res.reshape(b, s, h).astype(self.dtype)
 
         # PREFILL PATH
+        g = self.gate(t)
+        expert_weights, expert_indices = nn.op.topk(g, k=k, axis=-1, largest=True)
+        expert_weights = nn.op.softmax(expert_weights, axis=1)
+        expert_indices = expert_indices.astype("int32")
         cumsum = moe_cumsum(expert_indices, num_experts)
         rev_indices, token_indices = get_indices(cumsum, expert_indices)
 
