@@ -110,15 +110,21 @@ class MLPBlock(nn.Module):
         return self.forward_prefill(x, t, b, s, h, num_tokens)
 
     def forward_prefill(self, x, t, b, s, h, num_tokens):
+        # Note: We use standard nn.Linear for gating in prefill as gemv is optimized for single-token.
         g = self.gate(t)
         k = self.experts_per_token
         num_experts = self.num_experts
         lut = nn.Tensor.from_const(np.array(FP4_VALUES, dtype="float32"))
 
-        expert_weights, expert_indices = nn.op.topk(g, k=k, axis=-1, largest=True)
-        expert_weights = nn.op.softmax(expert_weights, axis=1)
-        expert_indices = expert_indices.astype("int32")
+        # Optimization: Use fused topk+softmax kernel
+        expert_weights, expert_indices = gating_softmax_topk(g, k)
         cumsum = moe_cumsum(expert_indices, num_experts)
+
+        # Note regarding group_gemm:
+        # The mlc_llm.op.moe_matmul.group_gemm / dequantize_group_gemm operators rely on
+        # standard integer packing (e.g. int4/int8) or fp8. Our weights use a custom MXFP4
+        # format with LUT-based dequantization, which is incompatible with the library kernels.
+        # Thus, we use our specialized 'mxfp4_moe_mlp*_prefill' kernels instead.
         rev_indices, token_indices = get_indices(cumsum, expert_indices)
 
         num_tokens_val = num_tokens if not isinstance(num_tokens, int) else tir.const(num_tokens, "int32")
