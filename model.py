@@ -1,7 +1,7 @@
 import dataclasses
 from functools import partial
 from math import log, pi, prod, sqrt
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Literal
 
 import mlc_llm.compiler_pass  # noqa: F401
 from mlc_llm import op as op_ext
@@ -11,31 +11,11 @@ from mlc_llm.support.config import ConfigBase
 from mlc_llm.support.style import bold
 from tvm import relax, te, tir
 from tvm.relax.frontend import nn
-from tvm.relax.frontend.nn import Tensor, op
 from tvm.script import tir as T
 
+from weights import FP4_VALUES
+
 logger = logging.getLogger(__name__)
-
-
-# TODO: TEMP location, please re-locate this
-FP4_VALUES = [
-    +0.0,
-    +0.5,
-    +1.0,
-    +1.5,
-    +2.0,
-    +3.0,
-    +4.0,
-    +6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-]
 
 
 def yarn_find_correction_dim(
@@ -98,12 +78,12 @@ def rope_freq_yarn(
 class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     """Configuration of the gpt-oss model."""
 
-    context_window_size: int = 40960
-    prefill_chunk_size: int = 0
+    context_window_size: int = 0
+    prefill_chunk_size: int = 8192
     tensor_parallel_shards: int = 1
     pipeline_parallel_stages: int = 1
     dtype: str = "bfloat16"
-    kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     num_hidden_layers: int = 36
     num_experts: int = 128
@@ -115,8 +95,8 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     num_attention_heads: int = 64
     num_key_value_heads: int = 8
     sliding_window_size: int = 128
-    rope_theta: Union[int, float] = 150000
-    rope_scaling: Optional[Dict] = None
+    rope_theta: int | float = 150_000
+    rope_scaling: dict | None = None
     swiglu_limit: float = 7.0
 
     # to use alternating dense-sliding Attention
@@ -125,7 +105,6 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     def __post_init__(self):
         if self.rope_scaling is None:
             self.rope_scaling = {
-                # "rope_type": "yarn",
                 "rope_theta": float(self.rope_theta),
                 "factor": 32.0,  # in gpt-oss, `rope_scaling_factor`
                 "beta_fast": 32.0,  # in gpt-oss, `rope_ntk_beta`
@@ -134,12 +113,11 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
                 "original_max_position_embeddings": 4096,  # in gpt-oss, `initial_context_length`
             }
 
-        if "quantization_config" in self.kwargs:
-            quantization_config = self.kwargs.get("quantization_config")
-            # FIXME(if needed)
-            pass
+        assert self.num_attention_heads > 0
+        assert self.num_key_value_heads > 0
+        assert self.head_dim > 0
+        assert self.num_attention_heads % self.num_key_value_heads == 0
 
-        # context_window_size = 40960, fixed
         if self.context_window_size == 0:
             for name in ["max_position_embeddings", "max_sequence_length"]:
                 if name in self.kwargs:
@@ -151,37 +129,21 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
                         self.context_window_size,
                     )
                     break
-            else:
-                raise ValueError(
-                    "Unable to determine the maximum sequence length, because none of "
-                    "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
-                    "provided in `config.json`."
-                )
-            if self.num_key_value_heads == 0:
-                self.num_key_value_heads = self.num_attention_heads
-            if self.head_dim == 0:
-                self.head_dim = self.hidden_size // self.num_attention_heads
-            assert self.num_attention_heads % self.num_key_value_heads == 0
-            # TODO: need to check `8192`; to another value
-            if self.prefill_chunk_size == 0:
-                self.prefill_chunk_size = min(self.context_window_size, 8192)
-                logger.info(
-                    "%s defaults to %d",
-                    bold("prefill_chunk_size"),
-                    self.prefill_chunk_size,
-                )
-            elif self.prefill_chunk_size > self.context_window_size:
-                logger.info(
-                    "Overriding %s from %d to %d",
-                    bold("prefill_chunk_size"),
-                    self.prefill_chunk_size,
-                    min(self.context_window_size, 8192),
-                )
-                self.prefill_chunk_size = min(self.context_window_size, 8192)
+        else:
+            # model originally supports 131_072(128k), but default value is capped to 40k.
+            self.context_window_size = 40960
+            logger.info(
+                "Unable to determine the maximum sequence length, because none of "
+                "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
+                "provided in `config.json`. So it is set to the default value %d.",
+                self.context_window_size,
+            )
+
+        self.prefill_chunk_size = min(self.context_window_size, self.prefill_chunk_size)
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, config: GPTOssConfig, layer_idx: int = 0, dtype: Optional[str] = None):
+    def __init__(self, config: GPTOssConfig, layer_idx: int = 0, dtype: str | None = None):
         assert config
         self.config = config
         if dtype is None:
@@ -192,6 +154,7 @@ class AttentionBlock(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.sliding_window = config.sliding_window_size if layer_idx % 2 == 0 else 0
         self.rope_theta = config.rope_theta
+        self.rope_scaling = config.rope_scaling
 
         self.sinks = nn.Parameter((config.num_attention_heads,), dtype=dtype)
         self.norm = nn.RMSNorm(config.hidden_size, axes=-1, bias=False, dtype=dtype)
@@ -211,20 +174,10 @@ class AttentionBlock(nn.Module):
         x: te.Tensor,
         positions: te.Tensor,
         rotary_dim: int,
-        theta: Union[float, tir.Var],
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        theta: float | tir.Var,
+        rope_scaling: dict[str, Any],
     ):
         x_dtype = x.dtype
-        if rope_scaling is None:
-            rope_scaling = {
-                # "rope_type": "yarn",
-                "rope_theta": float(self.rope_theta),
-                "factor": 32.0,
-                "beta_fast": 32.0,
-                "beta_slow": 1.0,
-                "truncate": False,
-                "original_max_position_embeddings": 4096,
-            }
 
         if isinstance(theta, tir.Var):
             theta = rope_scaling.get("rope_theta", self.rope_theta)
@@ -282,14 +235,15 @@ class AttentionBlock(nn.Module):
 
         return te.compute(x.shape, _rope_compute, name="yarn_rope")
 
-    def apply_rotation_to_qk(self, q: Tensor, k: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
+    def apply_rotation_to_qk(self, q: nn.Tensor, k: nn.Tensor, positions: nn.Tensor) -> tuple[nn.Tensor, nn.Tensor]:
         rope_ftn = partial(
             self._rope,
             rotary_dim=self.config.head_dim,
             theta=self.rope_theta,
+            rope_scaling=self.rope_scaling,
         )
-        q_embed = op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
-        k_embed = op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
+        q_embed = nn.op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
+        k_embed = nn.op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
 
         return q_embed, k_embed
 
@@ -362,14 +316,14 @@ class AttentionBlock(nn.Module):
         return x + t, paged_kv_cache
 
 
-def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16") -> Tensor:
+def swiglu(x: nn.Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16") -> nn.Tensor:
     shape = x.shape
     batch_shape = shape[:-1]
     last_dim = shape[-1]
     d = last_dim // 2
 
     # reshape: (..., 2 * d) -> (..., d, 2)
-    x_reshaped = op.reshape(x, (*batch_shape, d, 2))
+    x_reshaped = nn.op.reshape(x, (*batch_shape, d, 2))
 
     chunks = relax.op.split(x_reshaped._expr, indices_or_sections=2, axis=-1)
     chunk_glu = relax.TupleGetItem(chunks, 0)
@@ -381,16 +335,16 @@ def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str =
     x_linear_expr = relax.op.squeeze(chunk_linear, axis=-1)
     x_linear_expr = relax.op.astype(x_linear_expr, dtype=out_dtype)
 
-    alpha = op.wrap_nested(relax.const(alpha, dtype=out_dtype), name="alpha_const")
+    alpha = nn.op.wrap_nested(relax.const(alpha, dtype=out_dtype), name="alpha_const")
     limit_expr = relax.const(limit, dtype=out_dtype)
 
-    x_glu = op.wrap_nested(relax.op.minimum(x_glu_expr, limit_expr), name="x_glu_clip")
-    x_linear = op.wrap_nested(
+    x_glu = nn.op.wrap_nested(relax.op.minimum(x_glu_expr, limit_expr), name="x_glu_clip")
+    x_linear = nn.op.wrap_nested(
         relax.op.clip(x_linear_expr, min=-limit, max=limit),  # type: ignore
         name="x_linear_clip",
     )
 
-    gating = x_glu * op.sigmoid(alpha * x_glu)
+    gating = x_glu * nn.op.sigmoid(alpha * x_glu)
     output = gating * (x_linear + 1.0)
 
     return output
@@ -401,7 +355,7 @@ class MLPBlock(nn.Module):
         self,
         config: GPTOssConfig,
         rms_norm_eps: float = 1e-5,
-        dtype: Optional[str] = None,
+        dtype: str | None = None,
     ):
         """this block has the inner-dequantization of MXFP4 format weights"""
 
@@ -479,13 +433,106 @@ class MLPBlock(nn.Module):
             dtype=dtype,
         )
 
-    def run_einsum_fused(
+    def __dequantize_mxfp4_weight(
+        self,
+        blocks: nn.Tensor,
+        scales: nn.Tensor,
+        rows_per_chunk: int | None = None,  # unused, kept for compatibility
+    ) -> nn.Tensor:
+        import numpy as np
+
+        if rows_per_chunk is None:
+            rows_per_chunk = 16384 * 512
+        scales = scales.astype("int32") - 127
+        assert blocks.shape[:-1] == scales.shape, f"{blocks.shape=} does not match {scales.shape=}"
+        out_dtype = self.dtype
+
+        lut = nn.Tensor.from_const(np.array(FP4_VALUES, dtype=out_dtype))
+
+        *prefix_shape, group_size, bytes_per_block = blocks.shape
+        total_rows = prod(prefix_shape) * group_size
+
+        blocks = blocks.reshape(total_rows, bytes_per_block)
+        scales = scales.reshape(total_rows, 1)
+
+        # Process multiple rows per block for better GPU utilization
+        rows_per_block = 8
+        num_blocks = (total_rows + rows_per_block - 1) // rows_per_block
+
+        @T.prim_func(private=True)
+        def dequant_kernel(
+            blocks_handle: T.handle,
+            scales_handle: T.handle,
+            lut_handle: T.handle,
+            out_handle: T.handle,
+        ):
+            T.func_attr({"tir.noalias": True, "tir.is_scheduled": 1})
+            blocks_buf = T.match_buffer(blocks_handle, (total_rows, bytes_per_block), "uint8")
+            scales_buf = T.match_buffer(scales_handle, (total_rows, 1), "int32")
+            lut_buf = T.match_buffer(lut_handle, (16,), out_dtype)
+            out_buf = T.match_buffer(out_handle, (total_rows, 2 * bytes_per_block), out_dtype)
+
+            # Shared memory for LUT (16 values) and cached exp2 scales (per row)
+            lut_shared = T.alloc_buffer((16,), out_dtype, scope="shared")
+            scale_shared = T.alloc_buffer((rows_per_block,), "float32", scope="shared")
+
+            with T.block("init_dequantize"):
+                for block_idx in T.thread_binding(num_blocks, thread="blockIdx.x"):
+                    for local_idx in T.thread_binding(rows_per_block * bytes_per_block, thread="threadIdx.x"):
+                        # Load LUT into shared memory (first 16 threads)
+                        with T.block("load_lut"):
+                            vblock, vlocal = T.axis.remap("SS", [block_idx, local_idx])
+                            if vlocal < 16:
+                                lut_shared[vlocal] = lut_buf[vlocal]
+
+                        # Load and compute exp2 scales into shared memory (one per row)
+                        with T.block("load_scales"):
+                            vblock, vlocal = T.axis.remap("SS", [block_idx, local_idx])
+                            local_row = vlocal // bytes_per_block
+                            is_first_in_row = (vlocal % bytes_per_block) == 0
+                            vi = vblock * rows_per_block + local_row
+                            if is_first_in_row and vi < total_rows:
+                                exp_val = scales_buf[vi, 0]
+                                scale_shared[local_row] = T.exp2(T.cast(exp_val, "float32"))
+
+                        # Sync threads to ensure shared memory is populated
+                        with T.block("sync"):
+                            T.evaluate(0)
+
+                        # Main dequantization using shared memory
+                        with T.block("run_dequantize"):
+                            vblock, vlocal = T.axis.remap("SS", [block_idx, local_idx])
+                            local_row = vlocal // bytes_per_block
+                            vj = vlocal % bytes_per_block
+                            vi = vblock * rows_per_block + local_row
+
+                            if vi < total_rows:
+                                block_val = blocks_buf[vi, vj]
+                                ldexp_scale = scale_shared[local_row]
+
+                                idx_low = T.cast(block_val & T.uint8(0x0F), "int64")
+                                idx_high = T.cast(block_val >> T.uint8(4), "int64")
+
+                                out_buf[vi, 2 * vj] = lut_shared[idx_low] * ldexp_scale
+                                out_buf[vi, 2 * vj + 1] = lut_shared[idx_high] * ldexp_scale
+
+        out = nn.tensor_ir_op(
+            dequant_kernel,
+            "dequant_mxfp4",
+            args=[blocks, scales, lut],
+            out=nn.Tensor.placeholder((total_rows, 2 * bytes_per_block), dtype=out_dtype),
+        )
+
+        return out.reshape(*prefix_shape, 2 * group_size * bytes_per_block)
+
+    def run_einsum(
         self,
         input_tensor: nn.Tensor,
         expert_indices: nn.Tensor,
         weight_blocks: nn.Tensor,
         weight_scales: nn.Tensor,
         bias_tensor: nn.Tensor,
+        safetensor_dtype: str | None = None,
     ) -> nn.Tensor:
         """Fused einsum with on-the-fly MXFP4 dequantization.
 
@@ -572,7 +619,7 @@ class MLPBlock(nn.Module):
         self,
         input_tensor: nn.Tensor,
         expert_weights: nn.Tensor,
-        out_dtype: Optional[str] = None,
+        out_dtype: str | None = None,
     ):
         # f32 -> out_dtype
         seq_len, experts_per_token, out_features = input_tensor.shape
@@ -667,7 +714,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, config: GPTOssConfig, dtype: Optional[str] = None):
+    def __init__(self, config: GPTOssConfig, dtype: str | None = None):
         assert config
         if dtype is None:
             dtype = config.dtype
@@ -726,21 +773,21 @@ class GPTOssForCausalLM(nn.Module):
         # other setting
         self.sw_pattern = config.sliding_window_pattern
 
-    def to(self, dtype: Optional[str] = None):
+    def to(self, dtype: str | None = None):
         super().to(dtype=dtype)
         if dtype is not None:
             self.dtype = dtype
 
-    def _get_logits(self, hidden_states: Tensor) -> Tensor:
+    def _get_logits(self, hidden_states: nn.Tensor) -> nn.Tensor:
         logits = self.unembedding(hidden_states)
         if logits.dtype != "float32":
             logits = logits.astype("float32")
 
         return logits
 
-    def embed(self, input_ids: Tensor) -> Tensor:
+    def embed(self, input_ids: nn.Tensor) -> nn.Tensor:
         if self.tensor_parallel_shards > 1:
-            input_ids = op.ccl_broadcast_from_worker0(input_ids)
+            input_ids = nn.op.ccl_broadcast_from_worker0(input_ids)
         embed_ = self.model.embedding(input_ids)
 
         return nn.op.reshape(embed_, (1, -1, self.hidden_size))
