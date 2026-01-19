@@ -109,12 +109,15 @@ class MLPBlock(nn.Module):
             return self.forward_decode(x, t, b, s, h)
         return self.forward_prefill(x, t, b, s, h, num_tokens)
 
+    def get_lut(self, dtype: str) -> Tensor:
+        return nn.Tensor.from_const(np.array(FP4_VALUES, dtype=dtype))
+
     def forward_prefill(self, x, t, b, s, h, num_tokens):
         # Note: We use standard nn.Linear for gating in prefill as gemv is optimized for single-token.
         g = self.gate(t)
         k = self.experts_per_token
         num_experts = self.num_experts
-        lut = nn.Tensor.from_const(np.array(FP4_VALUES, dtype="float32"))
+        lut = self.get_lut(self.dtype)
 
         # Optimization: Use fused topk+softmax kernel
         expert_weights, expert_indices = gating_softmax_topk(g, k)
@@ -154,15 +157,20 @@ class MLPBlock(nn.Module):
             out=nn.Tensor.placeholder([num_tokens * k], "int32"),
         )
 
-        x_sorted = op.take(t, token_indices, axis=0)
+        x_sorted = op.take(t, token_indices, axis=0).astype(self.dtype)
         x_sorted = self.mxfp4_moe_mlp1_prefill(
             x_sorted, self.mlp1_weight_blocks, self.mlp1_weight_scales, self.mlp1_bias, token_expert_ids, lut
         )
         x_sorted = self.mxfp4_moe_mlp2_prefill(
-            x_sorted, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias, token_expert_ids, lut
+            x_sorted,
+            self.mlp2_weight_blocks,
+            self.mlp2_weight_scales,
+            self.mlp2_bias,
+            token_expert_ids,
+            lut,
         )
         x_scattered = scatter_output(x_sorted, rev_indices).reshape(num_tokens, k, h)
-        x_scattered = x_scattered * expert_weights.astype("float32").reshape(num_tokens, k, 1)
+        x_scattered = x_scattered * expert_weights.astype(self.dtype).reshape(num_tokens, k, 1)
         res = moe_sum(x_scattered, dim=1).reshape(b, s, h).astype(self.dtype)
 
         return x + res
@@ -170,7 +178,7 @@ class MLPBlock(nn.Module):
     def forward_decode(self, x, t, b, s, h):
         k = self.experts_per_token
         num_experts = self.num_experts
-        lut = nn.Tensor.from_const(np.array(FP4_VALUES, dtype="float32"))
+        lut = self.get_lut(self.dtype)
 
         # Step 0: Gating using optimized gemv
         # w_gate: (num_experts, 1, h), t: (1, h) -> out: (num_experts, 1)
@@ -183,7 +191,7 @@ class MLPBlock(nn.Module):
         expert_weights, expert_indices = gating_softmax_topk(g, k)
 
         token_expert_ids = expert_indices.reshape(k)
-        x_sorted = op.broadcast_to(t, [k, h])
+        x_sorted = op.broadcast_to(t, [k, h]).astype(self.dtype)
 
         # Step 1: Expert-Parallel MLP1
         x_intermediate = self.mxfp4_moe_mlp1_decode(
@@ -191,14 +199,19 @@ class MLPBlock(nn.Module):
         )
         # Step 2: Expert-Parallel MLP2
         x_expert_out = self.mxfp4_moe_mlp2_decode(
-            x_intermediate, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias, token_expert_ids, lut
+            x_intermediate,
+            self.mlp2_weight_blocks,
+            self.mlp2_weight_scales,
+            self.mlp2_bias,
+            token_expert_ids,
+            lut,
         )
 
         # Step 3: Weighted Average across experts using gemv
         # (1, k) @ (k, h) -> (1, h)
         w_sum = x_expert_out.permute_dims(1, 0).reshape(1, h, k)
         indptr_sum = op.full([1, 1], 0, dtype="int32")
-        res = gemv(expert_weights.astype("float32"), w_sum, indptr_sum)
+        res = gemv(expert_weights.astype(self.dtype), w_sum, indptr_sum)
 
         return x + res.reshape(b, s, h).astype(self.dtype)
 
@@ -224,8 +237,8 @@ class MLPBlock(nn.Module):
             scales_buf = T.match_buffer(var_s, (E, group_size, out_features), "uint8")
             bias_buf = T.match_buffer(var_bias, (E, out_features), bias.dtype)
             e_ids_buf = T.match_buffer(var_e, (B_val,), "int32")
-            lut_buf = T.match_buffer(var_lut, (16,), "float32")
-            out_buf = T.match_buffer(var_o, (B_val, N), "float32")
+            lut_buf = T.match_buffer(var_lut, (16,), self.dtype)
+            out_buf = T.match_buffer(var_o, (B_val, N), self.dtype)
             for vj_b in T.thread_binding((N + 127) // 128, thread="blockIdx.x"):
                 for vi_b in T.thread_binding((B_val + 3) // 4, thread="blockIdx.y"):
                     for vj_t in T.thread_binding(128, thread="threadIdx.x"):
@@ -237,7 +250,7 @@ class MLPBlock(nn.Module):
                             acc_l = T.alloc_buffer((4,), "float32", scope="local")
                             ids = T.alloc_buffer((4,), "int32", scope="local")
                             if vj_t < 16:
-                                lut_sh[vj_t] = lut_buf[vj_t]
+                                lut_sh[vj_t] = T.cast(lut_buf[vj_t], "float32")
                             for t in T.unroll(4):
                                 vi = vi_b * 4 + t
                                 if vi < B_val:
@@ -290,13 +303,13 @@ class MLPBlock(nn.Module):
                                     xg = T.min(acc_g[t], T.float32(self.swiglu_limit))
                                     xl = T.max(T.min(acc_l[t], T.float32(7.0)), T.float32(-7.0))
                                     gv = xg / (T.float32(1.0) + T.exp(-T.float32(1.702) * xg))
-                                    out_buf[vi_b * 4 + t, vj] = gv * (xl + T.float32(1.0))
+                                    out_buf[vi_b * 4 + t, vj] = T.cast(gv * (xl + T.float32(1.0)), self.dtype)
 
         return op.tensor_ir_op(
             _func,
             "mxfp4_moe_mlp1_prefill",
             args=[x, blocks, scales, bias, token_expert_ids, lut],
-            out=Tensor.placeholder([B_val_outer, N], "float32"),
+            out=Tensor.placeholder([B_val_outer, N], self.dtype),
         )
 
     def mxfp4_moe_mlp2_prefill(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
@@ -315,13 +328,13 @@ class MLPBlock(nn.Module):
         ):
             B_val = T.int32(is_size_var=True)
             T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
-            x_buf = T.match_buffer(var_x, (B_val, self.hidden_size), "float32")
+            x_buf = T.match_buffer(var_x, (B_val, self.hidden_size), self.dtype)
             blocks_buf = T.match_buffer(var_b, (E, group_size, B_L, N), "uint8")
             scales_buf = T.match_buffer(var_s, (E, group_size, N), "uint8")
             bias_buf = T.match_buffer(var_bias, (E, N), bias.dtype)
             e_ids_buf = T.match_buffer(var_e, (B_val,), "int32")
-            lut_buf = T.match_buffer(var_lut, (16,), "float32")
-            out_buf = T.match_buffer(var_o, (B_val, N), "float32")
+            lut_buf = T.match_buffer(var_lut, (16,), self.dtype)
+            out_buf = T.match_buffer(var_o, (B_val, N), self.dtype)
             for vj_b in T.thread_binding((N + 127) // 128, thread="blockIdx.x"):
                 for vi_b in T.thread_binding((B_val + 3) // 4, thread="blockIdx.y"):
                     for vj_t in T.thread_binding(128, thread="threadIdx.x"):
@@ -332,7 +345,7 @@ class MLPBlock(nn.Module):
                             acc = T.alloc_buffer((4,), "float32", scope="local")
                             ids = T.alloc_buffer((4,), "int32", scope="local")
                             if vj_t < 16:
-                                lut_sh[vj_t] = lut_buf[vj_t]
+                                lut_sh[vj_t] = T.cast(lut_buf[vj_t], "float32")
                             for t in T.unroll(4):
                                 vi = vi_b * 4 + t
                                 if vi < B_val:
@@ -343,12 +356,14 @@ class MLPBlock(nn.Module):
                                     acc[t] = 0.0
                             t_ld, d_ld = vj_t // 32, vj_t % 32
                             if (vi_b * 4 + t_ld) < B_val:
-                                x_sh[0, t_ld, d_ld] = x_buf[vi_b * 4 + t_ld, d_ld]
+                                x_sh[0, t_ld, d_ld] = T.cast(x_buf[vi_b * 4 + t_ld, d_ld], "float32")
                             T.tvm_storage_sync("shared")
                             for g in T.serial(group_size):
                                 if g + 1 < group_size:
                                     if (vi_b * 4 + t_ld) < B_val:
-                                        x_sh[(g + 1) % 2, t_ld, d_ld] = x_buf[vi_b * 4 + t_ld, (g + 1) * 32 + d_ld]
+                                        x_sh[(g + 1) % 2, t_ld, d_ld] = T.cast(
+                                            x_buf[vi_b * 4 + t_ld, (g + 1) * 32 + d_ld], "float32"
+                                        )
                                 if vj < N:
                                     for t in T.unroll(4):
                                         if ids[t] != -1:
@@ -366,13 +381,13 @@ class MLPBlock(nn.Module):
                                 T.tvm_storage_sync("shared")
                             for t in T.unroll(4):
                                 if (vi_b * 4 + t) < B_val and vj < N:
-                                    out_buf[vi_b * 4 + t, vj] = acc[t]
+                                    out_buf[vi_b * 4 + t, vj] = T.cast(acc[t], self.dtype)
 
         return op.tensor_ir_op(
             _func,
             "mxfp4_moe_mlp2_prefill",
             args=[x, blocks, scales, bias, token_expert_ids, lut],
-            out=Tensor.placeholder([B_val_outer, N], "float32"),
+            out=Tensor.placeholder([B_val_outer, N], self.dtype),
         )
 
     def mxfp4_moe_mlp1_decode(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
@@ -395,8 +410,8 @@ class MLPBlock(nn.Module):
             scales_buf = T.match_buffer(var_s, (E, group_size, out_features), "uint8")
             bias_buf = T.match_buffer(var_bias, (E, out_features), self.dtype)
             e_ids_buf = T.match_buffer(var_e, (4,), "int32")
-            lut_buf = T.match_buffer(var_lut, (16,), "float32")
-            out_buf = T.match_buffer(var_o, (4, N), "float32")
+            lut_buf = T.match_buffer(var_lut, (16,), self.dtype)
+            out_buf = T.match_buffer(var_o, (4, N), self.dtype)
             for vj_b in T.thread_binding((N + 127) // 128, thread="blockIdx.x"):
                 for vi_b in T.thread_binding(4, thread="blockIdx.y"):
                     for vj_t in T.thread_binding(128, thread="threadIdx.x"):
@@ -407,7 +422,7 @@ class MLPBlock(nn.Module):
                             acc_g = T.alloc_buffer((1,), "float32", scope="local")
                             acc_l = T.alloc_buffer((1,), "float32", scope="local")
                             if vj_t < 16:
-                                lut_sh[vj_t] = lut_buf[vj_t]
+                                lut_sh[vj_t] = T.cast(lut_buf[vj_t], "float32")
                             eid = e_ids_buf[vi_b]
                             if vj < N:
                                 acc_g[0] = T.cast(bias_buf[eid, vj * 2], "float32")
@@ -442,13 +457,13 @@ class MLPBlock(nn.Module):
                                 xg = T.min(acc_g[0], T.float32(self.swiglu_limit))
                                 xl = T.max(T.min(acc_l[0], T.float32(7.0)), T.float32(-7.0))
                                 gv = xg / (T.float32(1.0) + T.exp(-T.float32(1.702) * xg))
-                                out_buf[vi_b, vj] = gv * (xl + T.float32(1.0))
+                                out_buf[vi_b, vj] = T.cast(gv * (xl + T.float32(1.0)), self.dtype)
 
         return nn.tensor_ir_op(
             _func,
             "mxfp4_moe_mlp1_decode",
             args=[x, blocks, scales, bias, token_expert_ids, lut],
-            out=Tensor.placeholder([4, N], "float32"),
+            out=Tensor.placeholder([4, N], self.dtype),
         )
 
     def mxfp4_moe_mlp2_decode(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
@@ -465,13 +480,13 @@ class MLPBlock(nn.Module):
             var_o: T.handle,
         ):
             T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
-            x_buf = T.match_buffer(var_x, (4, self.hidden_size), "float32")
+            x_buf = T.match_buffer(var_x, (4, self.hidden_size), self.dtype)
             blocks_buf = T.match_buffer(var_b, (E, group_size, B_L, N), "uint8")
             scales_buf = T.match_buffer(var_s, (E, group_size, N), "uint8")
             bias_buf = T.match_buffer(var_bias, (E, N), self.dtype)
             e_ids_buf = T.match_buffer(var_e, (4,), "int32")
-            lut_buf = T.match_buffer(var_lut, (16,), "float32")
-            out_buf = T.match_buffer(var_o, (4, N), "float32")
+            lut_buf = T.match_buffer(var_lut, (16,), self.dtype)
+            out_buf = T.match_buffer(var_o, (4, N), self.dtype)
             for vj_b in T.thread_binding((N + 127) // 128, thread="blockIdx.x"):
                 for vi_b in T.thread_binding(4, thread="blockIdx.y"):
                     for vj_t in T.thread_binding(128, thread="threadIdx.x"):
@@ -481,16 +496,16 @@ class MLPBlock(nn.Module):
                             lut_sh = T.alloc_buffer((16,), "float32", scope="shared")
                             acc = T.alloc_buffer((1,), "float32", scope="local")
                             if vj_t < 16:
-                                lut_sh[vj_t] = lut_buf[vj_t]
+                                lut_sh[vj_t] = T.cast(lut_buf[vj_t], "float32")
                             eid = e_ids_buf[vi_b]
                             acc[0] = T.cast(bias_buf[eid, vj], "float32") if vj < N else 0.0
                             if vj_t < 32:
-                                x_sh[0, vj_t] = x_buf[vi_b, vj_t]
+                                x_sh[0, vj_t] = T.cast(x_buf[vi_b, vj_t], "float32")
                             T.tvm_storage_sync("shared")
                             for g in T.serial(group_size):
                                 if g + 1 < group_size:
                                     if vj_t < 32:
-                                        x_sh[(g + 1) % 2, vj_t] = x_buf[vi_b, (g + 1) * 32 + vj_t]
+                                        x_sh[(g + 1) % 2, vj_t] = T.cast(x_buf[vi_b, (g + 1) * 32 + vj_t], "float32")
                                 if vj < N:
                                     sc = T.exp2(T.cast(T.cast(scales_buf[eid, g, vj], "int32") - 127, "float32"))
                                     for b in T.unroll(B_L):
@@ -500,11 +515,11 @@ class MLPBlock(nn.Module):
                                         acc[0] = acc[0] + (x_sh[g % 2, b * 2] * w0 + x_sh[g % 2, b * 2 + 1] * w1) * sc
                                 T.tvm_storage_sync("shared")
                             if vj < N:
-                                out_buf[vi_b, vj] = acc[0]
+                                out_buf[vi_b, vj] = T.cast(acc[0], self.dtype)
 
         return nn.tensor_ir_op(
             _func,
             "mxfp4_moe_mlp2_decode",
             args=[x, blocks, scales, bias, token_expert_ids, lut],
-            out=Tensor.placeholder([4, N], "float32"),
+            out=Tensor.placeholder([4, N], self.dtype),
         )

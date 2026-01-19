@@ -130,7 +130,7 @@ class AttentionBlock(nn.Module):
             rotary_half = rotary_dim // 2
             freq_idx = dim_idx % rotary_half
 
-            cos_freq, sin_freq, var_map = yarn_ftn(positions[seq_idx], freq_idx, rotary_dim, theta, "float32")
+            cos_freq, sin_freq, var_map = yarn_ftn(positions[seq_idx], freq_idx, rotary_dim, theta, x_dtype)
 
             # dim_idx: the index in the interval [0, head_dim)
             # z = r^(i*theta) = cos(theta) + i * sin(theta)
@@ -245,6 +245,5 @@ class AttentionBlock(nn.Module):
         )
 
         t = self.out(t)
-        t = t.astype(self.dtype)
 
         return x + t, paged_kv_cache
