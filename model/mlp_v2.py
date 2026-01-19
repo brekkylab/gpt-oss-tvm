@@ -106,6 +106,29 @@ class MLPBlock(nn.Module):
         expert_weights = nn.op.softmax(expert_weights, axis=1)
         expert_indices = expert_indices.astype("int32")
 
+        # LIGHTWEIGHT DECODE PATH (B=1 optimization)
+        if isinstance(num_tokens, int) and num_tokens == 1:
+            import numpy as np
+
+            # Fast index construction for 1 token
+            token_indices = nn.Tensor.from_const(np.zeros(k, dtype="int32"))
+            rev_indices = nn.Tensor.from_const(np.arange(k, dtype="int32"))
+            token_expert_ids = expert_indices.reshape(k)
+
+            # Reusing stable kernels with manual indices
+            x_sorted = op.take(t, token_indices, axis=0)
+            x_sorted = self.mxfp4_moe_mlp1(
+                x_sorted, self.mlp1_weight_blocks, self.mlp1_weight_scales, self.mlp1_bias, token_expert_ids, lut
+            )
+            x_sorted = self.mxfp4_moe_mlp2(
+                x_sorted, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias, token_expert_ids, lut
+            )
+            # Standard scatter & sum (Correctness guaranteed)
+            x_scattered = scatter_output(x_sorted, rev_indices).reshape(num_tokens, k, h)
+            x_scattered = x_scattered * expert_weights.astype("float32").reshape(num_tokens, k, 1)
+            res = moe_sum(x_scattered, dim=1).reshape(b, s, h).astype(self.dtype)
+            return x + res
+
         cumsum = moe_cumsum(expert_indices, num_experts)
         rev_indices, token_indices = get_indices(cumsum, expert_indices)
 
