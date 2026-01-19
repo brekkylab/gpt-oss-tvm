@@ -104,9 +104,6 @@ class MLPBlock(nn.Module):
         num_tokens = b * s
         x_reshaped = x.reshape(num_tokens, h)
         t = self.norm(x_reshaped)
-        k = self.experts_per_token
-        num_experts = self.num_experts
-        lut = self.get_lut("float32")
 
         # ROBUST HIGH-PERFORMANCE DECODE PATH (B=1 optimization)
         is_decode = False
@@ -118,37 +115,49 @@ class MLPBlock(nn.Module):
                 is_decode = True
 
         if is_decode:
-            # Step 0: Gating using optimized gemv
-            # w_gate: (num_experts, 1, h), t: (1, h) -> out: (num_experts, 1)
-            g = gemv(t, self.gate.weight.reshape(self.num_experts, 1, h), self.gate_indptr)
-            g = g.reshape(1, self.num_experts)
-            if self.gate.bias is not None:
-                g = op.add(g, self.gate.bias.reshape(1, num_experts))
+            return self.forward_decode(x, t, b, s, h)
+        return self.forward_prefill(x, t, b, s, h, num_tokens)
 
-            expert_weights, expert_indices = gating_softmax_topk(g, k)
+    def forward_decode(self, x, t, b, s, h):
+        k = self.experts_per_token
+        num_experts = self.num_experts
+        lut = self.get_lut("float32")
 
-            token_expert_ids = expert_indices.reshape(k)
-            x_sorted = op.broadcast_to(t, [k, h])
+        # Step 0: Gating using optimized gemv
+        # w_gate: (num_experts, 1, h), t: (1, h) -> out: (num_experts, 1)
+        g = gemv(t, self.gate.weight.reshape(self.num_experts, 1, h), self.gate_indptr)
+        g = g.reshape(1, self.num_experts)
+        if self.gate.bias is not None:
+            g = op.add(g, self.gate.bias.reshape(1, num_experts))
 
-            # Step 1: Expert-Parallel MLP1 (v17 style) - Proven Correct and Fast
-            x_intermediate = self.mxfp4_decode_mlp1_v20(
-                x_sorted, self.mlp1_weight_blocks, self.mlp1_weight_scales, self.mlp1_bias, token_expert_ids, lut
-            )
-            # Step 2: Expert-Parallel MLP2 (v17 style) - Proven Correct and Fast
-            x_expert_out = self.mxfp4_decode_mlp2_v20(
-                x_intermediate, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias, token_expert_ids, lut
-            )
+        expert_weights, expert_indices = gating_softmax_topk(g, k)
 
-            # Step 3: Weighted Average across experts using gemv (from moe_matmul)
-            # (1, k) @ (k, h) -> (1, h)
-            w_sum = x_expert_out.permute_dims(1, 0).reshape(1, h, k)
-            indptr_sum = op.full([1, 1], 0, dtype="int32")
-            res = gemv(expert_weights.astype("float32"), w_sum, indptr_sum)
+        token_expert_ids = expert_indices.reshape(k)
+        x_sorted = op.broadcast_to(t, [k, h])
 
-            return x + res.reshape(b, s, h).astype(self.dtype)
+        # Step 1: Expert-Parallel MLP1 (v17 style) - Proven Correct and Fast
+        x_intermediate = self.mxfp4_decode_mlp1_v20(
+            x_sorted, self.mlp1_weight_blocks, self.mlp1_weight_scales, self.mlp1_bias, token_expert_ids, lut
+        )
+        # Step 2: Expert-Parallel MLP2 (v17 style) - Proven Correct and Fast
+        x_expert_out = self.mxfp4_decode_mlp2_v20(
+            x_intermediate, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias, token_expert_ids, lut
+        )
 
-        # PREFILL PATH
+        # Step 3: Weighted Average across experts using gemv (from moe_matmul)
+        # (1, k) @ (k, h) -> (1, h)
+        w_sum = x_expert_out.permute_dims(1, 0).reshape(1, h, k)
+        indptr_sum = op.full([1, 1], 0, dtype="int32")
+        res = gemv(expert_weights.astype("float32"), w_sum, indptr_sum)
+
+        return x + res.reshape(b, s, h).astype(self.dtype)
+
+    def forward_prefill(self, x, t, b, s, h, num_tokens):
         g = self.gate(t)
+        k = self.experts_per_token
+        num_experts = self.num_experts
+        lut = self.get_lut("float32")
+
         expert_weights, expert_indices = nn.op.topk(g, k=k, axis=-1, largest=True)
         expert_weights = nn.op.softmax(expert_weights, axis=1)
         expert_indices = expert_indices.astype("int32")
