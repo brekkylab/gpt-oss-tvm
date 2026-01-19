@@ -1,6 +1,6 @@
 import dataclasses
 from functools import partial
-from math import log, pi, prod, sqrt
+from math import log, pi, sqrt
 from typing import Any, Dict, Literal, Optional, Union
 
 import mlc_llm.compiler_pass  # noqa: F401
