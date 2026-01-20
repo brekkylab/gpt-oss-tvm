@@ -35,14 +35,17 @@ Cloning repository is already done through the git submodule command above.
 
 #### Install Python bindings
 ```bash
-# apache-tvm-ffi 
+# apache-tvm-ffi
+# install from source (recommended)
 cd 3rdparty/mlc-llm/3rdparty/tvm/3rdparty/tvm-ffi
-pip install -e .
+pip install .
 cd -
+# or just use PyPI version
+pip install apache-tvm-ffi<=0.1.7
 
 # tvm
 cd 3rdparty/mlc-llm/3rdparty/tvm/python
-pip install -e .
+pip install .
 cd -
 
 # tvm extra dependencies
@@ -52,7 +55,7 @@ pip install psutil
 # mlc-llm
 cd 3rdparty/mlc-llm/python
 # if you use macOS, you need to exclude `flashinfer` dependency from `./requirements.txt`
-pip install -e .
+pip install .
 cd -
 ```
 
