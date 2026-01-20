@@ -1,7 +1,7 @@
 import re
 import time
 from pathlib import Path
-from typing import Callable, Literal, Optional, Sequence
+from typing import Callable, Literal, Sequence
 
 import mlc_llm.compiler_pass  # noqa: F401
 import numpy as np
@@ -14,8 +14,8 @@ from torch.utils.dlpack import to_dlpack
 # from tqdm import tqdm
 from tvm import relax, runtime
 from tvm.relax.frontend import nn
+from tvm.runtime import Device as TVMDevice
 from tvm.target import Target
-from tvm_ffi import Device as TVMDevice
 from tvm_ffi import DLDeviceType
 
 from model import GPTOssConfig, GPTOssForCausalLM
@@ -51,10 +51,10 @@ def to_pytorch_device(device: TVMDevice):
 
 def load_original_safetensors(
     st_path: Path,
-    block_indices: Optional[Sequence[int]] = None,
+    block_indices: Sequence[int] | None = None,
     include_unnumbered_blocks: bool = True,
     key_pattern: str = r"block\.(\d+)\.",
-    device: Optional[runtime.Device] = None,
+    device: runtime.Device | None = None,
 ):
     st_path = Path(st_path) / "model.safetensors" if st_path.suffix != ".safetensors" else st_path
     if not st_path.exists():
@@ -150,8 +150,8 @@ class Engine:
     def __init__(
         self,
         model_path: str | Path,
-        target: str = "metal",
-        dump_metal_path: Optional[str | Path] = None,
+        target: Literal["cpu", "llvm", "metal", "vulkan", "cuda"] = "metal",
+        dump_metal_path: str | Path | None = None,
     ):
         self.model_path = Path(model_path)
         self.config = GPTOssConfig.from_file(self.model_path / "config.json")
@@ -201,14 +201,14 @@ class Engine:
         metadata = {
             "model_type": "gpt-oss",
             "context_window_size": self.config.context_window_size,
-            "sliding_window_size": getattr(self.config, "sliding_window_size", 128),
+            "sliding_window_size": self.config.sliding_window_size,
             "attention_sink_size": 0,
             "prefill_chunk_size": self.config.prefill_chunk_size,  # type: ignore
             "tensor_parallel_shards": self.config.tensor_parallel_shards,  # type: ignore
             "pipeline_parallel_stages": self.config.pipeline_parallel_stages,
             "kv_state_kind": "kv_cache",
             "max_batch_size": 1,
-            "rope_theta": 150_000,
+            "rope_theta": self.config.rope_theta,
         }
 
         with Target.from_device(target):
@@ -243,7 +243,7 @@ class Engine:
                     src = m.inspect_source()
                     if src and "#include <metal_stdlib>" in src:
                         return m
-            except:
+            except Exception:
                 pass
 
             try:
@@ -257,7 +257,7 @@ class Engine:
                     res = find_metal(sub, seen)
                     if res:
                         return res
-            except:
+            except Exception:
                 pass
             return None
 
@@ -379,5 +379,6 @@ class Engine:
         dummy_input = np.array([0], dtype="int32")
         seq_id = self.begin_sequence()
         self.prefill(dummy_input, seq_id)
+        self.decode(dummy_input, seq_id)
         self.clear_kv_cache()
         self.__class__.next_seq_id = 0
