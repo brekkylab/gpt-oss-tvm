@@ -29,33 +29,35 @@ Cloning repository is already done through the git submodule command above.
     You will perform the tasks similar to this:
     ```bash
     mkdir build && cd build
-    python ../cmake/gen_cmake_config.py  # Answer in y/n to generate configuration
+    python ../cmake/gen_cmake_config.py      # Answer this script to generate configuration
+    export CMAKE_POLICY_VERSION_MINIMUM=3.5  # Recommended to avoid the CMake error on `tokenizer-cpp`
     cmake .. && cmake --build . --parallel $(nproc)
     ```
 
 #### Install Python bindings
 ```bash
-# apache-tvm-ffi
-# install from source (recommended)
+# << apache-tvm-ffi >>
+# Install from source (recommended)
 cd 3rdparty/mlc-llm/3rdparty/tvm/3rdparty/tvm-ffi
-pip install .
+pip install -e .
 cd -
-# or just use PyPI version
+# ... Or just use PyPI version
 pip install apache-tvm-ffi<=0.1.7
 
-# tvm
+# << tvm >>
 cd 3rdparty/mlc-llm/3rdparty/tvm/python
-pip install .
+pip install -e .
 cd -
-
-# tvm extra dependencies
+# Extra dependencies for tvm
 # c.f. https://tvm.apache.org/docs/install/from_source.html#step-5-extra-python-dependencies
 pip install psutil
 
-# mlc-llm
+# << mlc-llm >>
 cd 3rdparty/mlc-llm/python
-# if you use macOS, you need to exclude `flashinfer` dependency from `./requirements.txt`
-pip install .
+# Notes on handling `flashinfer-python` in `requirements.txt`
+#  - exclude installation on unsupported platforms (e.g. macOS)
+#  - use version constraint `>=0.5.0` for better dependency resolution
+pip install -e .
 cd -
 ```
 
