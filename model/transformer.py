@@ -33,7 +33,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, config: GPTOssConfig, dtype: Optional[str] = None):
+    def __init__(self, config: GPTOssConfig, dtype: str | None = None):
         assert config
         if dtype is None:
             dtype = config.dtype
@@ -92,7 +92,7 @@ class GPTOssForCausalLM(nn.Module):
         # other setting
         self.sw_pattern = config.sliding_window_pattern
 
-    def to(self, dtype: Optional[str] = None):
+    def to(self, dtype: str | None = None):
         super().to(dtype=dtype)
         if dtype is not None:
             self.dtype = dtype
