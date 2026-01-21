@@ -149,13 +149,8 @@ class MLPBlock(nn.Module):
         weight_blocks: nn.Tensor,
         weight_scales: nn.Tensor,
         bias_tensor: nn.Tensor,
-        safetensor_dtype: str | None = None,
     ) -> nn.Tensor:
-        """Fused einsum with on-the-fly MXFP4 dequantization.
-
-        Uses single in_idx loop like original run_einsum.
-        Computes group_idx, byte_idx, nibble from in_idx.
-        """
+        """Fused einsum with on-the-fly MXFP4 dequantization."""
         import numpy as np
 
         einsum_dtype = "float32"
@@ -164,15 +159,20 @@ class MLPBlock(nn.Module):
         seq_len = input_tensor.shape[0]
         input_shape = input_tensor.shape
         input_is_3d = len(input_shape) == 3
+        hidden_size = input_shape[2] if input_is_3d else input_shape[1]
 
         _, experts_per_token = expert_indices.shape
         num_all_experts, out_features, group_size, bytes_per_block = weight_blocks.shape
-        in_features = group_size * bytes_per_block * 2  # 90 * 16 * 2 = 2880
+        in_features = group_size * bytes_per_block * 2
 
         lut = nn.Tensor.from_const(np.array(FP4_VALUES, dtype=safetensor_dtype))
 
+        tokens_per_block = 4
+        threads_per_block = 128
+        out_tile_size = 128
+
         @T.prim_func(private=True)
-        def _einsum_fused(
+        def _einsum_fused_2d(
             x_handle: T.handle,
             e_indices: T.Buffer((seq_len, experts_per_token), "int32"),
             blocks: T.Buffer((num_all_experts, out_features, group_size, bytes_per_block), "uint8"),
@@ -181,52 +181,150 @@ class MLPBlock(nn.Module):
             lut_buf: T.Buffer((16,), safetensor_dtype),
             out_handle: T.handle,
         ):
-            T.func_attr({"op_pattern": 4, "tir.noalias": True})
-            x = T.match_buffer(x_handle, input_shape, input_tensor.dtype)
+            T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
+            x = T.match_buffer(x_handle, (seq_len, hidden_size), input_tensor.dtype)
             out = T.match_buffer(out_handle, (seq_len, experts_per_token, out_features), einsum_dtype)
 
-            for s, r, c in T.grid(seq_len, experts_per_token, out_features):
-                with T.block("compute_fused_einsum"):
-                    seq_idx, expert_rank, out_idx = T.axis.remap("SSS", [s, r, c])
-                    e_idx = e_indices[seq_idx, expert_rank]
+            for out_block_idx in T.thread_binding(
+                (out_features + out_tile_size - 1) // out_tile_size, thread="blockIdx.x"
+            ):
+                for token_block_idx in T.thread_binding(
+                    (seq_len + tokens_per_block - 1) // tokens_per_block, thread="blockIdx.y"
+                ):
+                    for thread_idx in T.thread_binding(threads_per_block, thread="threadIdx.x"):
+                        with T.block("compute"):
+                            out_idx = out_block_idx * out_tile_size + thread_idx
 
-                    sum_buffer = T.alloc_buffer((1,), dtype=einsum_dtype, scope="local")
-                    sum_buffer[0] = T.cast(bias[e_idx, out_idx], einsum_dtype)
+                            acc = T.alloc_buffer((tokens_per_block, experts_per_token), einsum_dtype, scope="local")
+                            expert_ids = T.alloc_buffer((tokens_per_block, experts_per_token), "int32", scope="local")
 
-                    for in_idx in T.serial(in_features):
-                        # Compute group_idx, byte_idx, nibble position from in_idx
-                        group_idx = in_idx // 32  # 32 = bytes_per_block * 2
-                        local_idx = in_idx % 32
-                        byte_idx = local_idx // 2
-                        is_high = local_idx % 2
+                            for local_token in T.unroll(tokens_per_block):
+                                token_idx = token_block_idx * tokens_per_block + local_token
+                                for expert_rank in T.serial(experts_per_token):
+                                    if token_idx < seq_len:
+                                        expert_ids[local_token, expert_rank] = e_indices[token_idx, expert_rank]
+                                        if out_idx < out_features:
+                                            acc[local_token, expert_rank] = T.cast(
+                                                bias[expert_ids[local_token, expert_rank], out_idx], einsum_dtype
+                                            )
+                                        else:
+                                            acc[local_token, expert_rank] = T.float32(0.0)
+                                    else:
+                                        expert_ids[local_token, expert_rank] = 0
+                                        acc[local_token, expert_rank] = T.float32(0.0)
 
-                        # Read scale
-                        scale_val = T.cast(scales[e_idx, out_idx, group_idx], "int32") - 127
-                        ldexp_scale = T.exp2(T.cast(scale_val, "float32"))
+                            if out_idx < out_features:
+                                for local_token in T.unroll(tokens_per_block):
+                                    token_idx = token_block_idx * tokens_per_block + local_token
+                                    if token_idx < seq_len:
+                                        for expert_rank in T.serial(experts_per_token):
+                                            e_idx = expert_ids[local_token, expert_rank]
+                                            for in_idx in T.serial(in_features):
+                                                group_idx = in_idx // 32
+                                                local_idx = in_idx % 32
+                                                byte_idx = local_idx // 2
+                                                is_high = local_idx % 2
 
-                        # Read block and extract nibble without if-else branching
-                        block_val = blocks[e_idx, out_idx, group_idx, byte_idx]
-                        shift_amount = T.cast(is_high * 4, "uint8")
-                        nibble_idx = T.cast((block_val >> shift_amount) & T.uint8(0x0F), "int64")
+                                                scale_val = T.cast(scales[e_idx, out_idx, group_idx], "int32") - 127
+                                                ldexp_scale = T.exp2(T.cast(scale_val, "float32"))
 
-                        # Accumulate
-                        if input_is_3d:
-                            sum_buffer[0] += (
-                                T.cast(x[seq_idx, expert_rank, in_idx], einsum_dtype)
-                                * T.cast(lut_buf[nibble_idx], einsum_dtype)
-                                * ldexp_scale
-                            )
-                        else:
-                            sum_buffer[0] += (
-                                T.cast(x[seq_idx, in_idx], einsum_dtype)
-                                * T.cast(lut_buf[nibble_idx], einsum_dtype)
-                                * ldexp_scale
-                            )
+                                                block_val = blocks[e_idx, out_idx, group_idx, byte_idx]
+                                                shift_amount = T.cast(is_high * 4, "uint8")
+                                                nibble_idx = T.cast(
+                                                    (block_val >> shift_amount) & T.uint8(0x0F), "int64"
+                                                )
 
-                    out[seq_idx, expert_rank, out_idx] = sum_buffer[0]
+                                                acc[local_token, expert_rank] += (
+                                                    T.cast(x[token_idx, in_idx], einsum_dtype)
+                                                    * T.cast(lut_buf[nibble_idx], einsum_dtype)
+                                                    * ldexp_scale
+                                                )
+
+                            for local_token in T.unroll(tokens_per_block):
+                                token_idx = token_block_idx * tokens_per_block + local_token
+                                if token_idx < seq_len and out_idx < out_features:
+                                    for expert_rank in T.serial(experts_per_token):
+                                        out[token_idx, expert_rank, out_idx] = acc[local_token, expert_rank]
+
+        @T.prim_func(private=True)
+        def _einsum_fused_3d(
+            x_handle: T.handle,
+            e_indices: T.Buffer((seq_len, experts_per_token), "int32"),
+            blocks: T.Buffer((num_all_experts, out_features, group_size, bytes_per_block), "uint8"),
+            scales: T.Buffer((num_all_experts, out_features, group_size), "uint8"),
+            bias: T.Buffer((num_all_experts, out_features), safetensor_dtype),
+            lut_buf: T.Buffer((16,), safetensor_dtype),
+            out_handle: T.handle,
+        ):
+            T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
+            x = T.match_buffer(x_handle, (seq_len, experts_per_token, hidden_size), input_tensor.dtype)
+            out = T.match_buffer(out_handle, (seq_len, experts_per_token, out_features), einsum_dtype)
+
+            for out_block_idx in T.thread_binding(
+                (out_features + out_tile_size - 1) // out_tile_size, thread="blockIdx.x"
+            ):
+                for token_block_idx in T.thread_binding(
+                    (seq_len + tokens_per_block - 1) // tokens_per_block, thread="blockIdx.y"
+                ):
+                    for thread_idx in T.thread_binding(threads_per_block, thread="threadIdx.x"):
+                        with T.block("compute"):
+                            out_idx = out_block_idx * out_tile_size + thread_idx
+
+                            acc = T.alloc_buffer((tokens_per_block, experts_per_token), einsum_dtype, scope="local")
+                            expert_ids = T.alloc_buffer((tokens_per_block, experts_per_token), "int32", scope="local")
+
+                            for local_token in T.unroll(tokens_per_block):
+                                token_idx = token_block_idx * tokens_per_block + local_token
+                                for expert_rank in T.serial(experts_per_token):
+                                    if token_idx < seq_len:
+                                        expert_ids[local_token, expert_rank] = e_indices[token_idx, expert_rank]
+                                        if out_idx < out_features:
+                                            acc[local_token, expert_rank] = T.cast(
+                                                bias[expert_ids[local_token, expert_rank], out_idx], einsum_dtype
+                                            )
+                                        else:
+                                            acc[local_token, expert_rank] = T.float32(0.0)
+                                    else:
+                                        expert_ids[local_token, expert_rank] = 0
+                                        acc[local_token, expert_rank] = T.float32(0.0)
+
+                            if out_idx < out_features:
+                                for local_token in T.unroll(tokens_per_block):
+                                    token_idx = token_block_idx * tokens_per_block + local_token
+                                    if token_idx < seq_len:
+                                        for expert_rank in T.serial(experts_per_token):
+                                            e_idx = expert_ids[local_token, expert_rank]
+                                            for in_idx in T.serial(in_features):
+                                                group_idx = in_idx // 32
+                                                local_idx = in_idx % 32
+                                                byte_idx = local_idx // 2
+                                                is_high = local_idx % 2
+
+                                                scale_val = T.cast(scales[e_idx, out_idx, group_idx], "int32") - 127
+                                                ldexp_scale = T.exp2(T.cast(scale_val, "float32"))
+
+                                                block_val = blocks[e_idx, out_idx, group_idx, byte_idx]
+                                                shift_amount = T.cast(is_high * 4, "uint8")
+                                                nibble_idx = T.cast(
+                                                    (block_val >> shift_amount) & T.uint8(0x0F), "int64"
+                                                )
+
+                                                acc[local_token, expert_rank] += (
+                                                    T.cast(x[token_idx, expert_rank, in_idx], einsum_dtype)
+                                                    * T.cast(lut_buf[nibble_idx], einsum_dtype)
+                                                    * ldexp_scale
+                                                )
+
+                            for local_token in T.unroll(tokens_per_block):
+                                token_idx = token_block_idx * tokens_per_block + local_token
+                                if token_idx < seq_len and out_idx < out_features:
+                                    for expert_rank in T.serial(experts_per_token):
+                                        out[token_idx, expert_rank, out_idx] = acc[local_token, expert_rank]
+
+        kernel = _einsum_fused_3d if input_is_3d else _einsum_fused_2d
 
         return nn.tensor_ir_op(
-            _einsum_fused,
+            kernel,
             "moe_einsum_fused",
             args=[input_tensor, expert_indices, weight_blocks, weight_scales, bias_tensor, lut],
             out=nn.Tensor.placeholder((seq_len, experts_per_token, out_features), einsum_dtype),
@@ -238,7 +336,6 @@ class MLPBlock(nn.Module):
         expert_weights: nn.Tensor,
         out_dtype: str | None = None,
     ):
-
         seq_len, experts_per_token, out_features = input_tensor.shape
         block_dtype = "float32"
         if out_dtype is None:
