@@ -1,3 +1,4 @@
+import gc
 from pathlib import Path
 from typing import Literal
 
@@ -91,6 +92,10 @@ class TVMCheckpoint:
                     torch_tensor = torch_tensor.to(torch.uint8)
                 tvm_tensor = tvm.runtime.from_dlpack(to_dlpack(torch_tensor))
                 tvm_params[name] = tvm_tensor
+
+                # prevent memory pressure
+                gc.collect()
+
         return tvm_params
 
     def get_tvm_tensor(self, name: str) -> tvm_ffi.Tensor:
