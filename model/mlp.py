@@ -1,8 +1,7 @@
-from typing import Optional
+from math import prod
 
 from tvm import relax
 from tvm.relax.frontend import nn
-from tvm.relax.frontend.nn import Tensor, op
 from tvm.script import tir as T
 
 from .config import GPTOssConfig
@@ -27,14 +26,14 @@ FP4_VALUES = [
 ]
 
 
-def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16") -> Tensor:
+def swiglu(x: nn.Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str = "bfloat16") -> nn.Tensor:
     shape = x.shape
     batch_shape = shape[:-1]
     last_dim = shape[-1]
     d = last_dim // 2
 
     # reshape: (..., 2 * d) -> (..., d, 2)
-    x_reshaped = op.reshape(x, (*batch_shape, d, 2))
+    x_reshaped = nn.op.reshape(x, (*batch_shape, d, 2))
 
     chunks = relax.op.split(x_reshaped._expr, indices_or_sections=2, axis=-1)
     chunk_glu = relax.TupleGetItem(chunks, 0)
@@ -46,16 +45,16 @@ def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0, out_dtype: str =
     x_linear_expr = relax.op.squeeze(chunk_linear, axis=-1)
     x_linear_expr = relax.op.astype(x_linear_expr, dtype=out_dtype)
 
-    alpha = op.wrap_nested(relax.const(alpha, dtype=out_dtype), name="alpha_const")
+    alpha = nn.op.wrap_nested(relax.const(alpha, dtype=out_dtype), name="alpha_const")
     limit_expr = relax.const(limit, dtype=out_dtype)
 
-    x_glu = op.wrap_nested(relax.op.minimum(x_glu_expr, limit_expr), name="x_glu_clip")
-    x_linear = op.wrap_nested(
+    x_glu = nn.op.wrap_nested(relax.op.minimum(x_glu_expr, limit_expr), name="x_glu_clip")
+    x_linear = nn.op.wrap_nested(
         relax.op.clip(x_linear_expr, min=-limit, max=limit),  # type: ignore
         name="x_linear_clip",
     )
 
-    gating = x_glu * op.sigmoid(alpha * x_glu)
+    gating = x_glu * nn.op.sigmoid(alpha * x_glu)
     output = gating * (x_linear + 1.0)
 
     return output
@@ -66,7 +65,7 @@ class MLPBlock(nn.Module):
         self,
         config: GPTOssConfig,
         rms_norm_eps: float = 1e-5,
-        dtype: Optional[str] = None,
+        dtype: str | None = None,
     ):
         """this block has the inner-dequantization of MXFP4 format weights"""
 
@@ -92,7 +91,6 @@ class MLPBlock(nn.Module):
             dtype=dtype,
         )
         assert config.intermediate_size % self.world_size == 0
-        self.intermediate_size = config.intermediate_size // self.world_size
 
         # for MXFP4 dequantization
         self.mxfp4_dtype = "uint8"
@@ -145,13 +143,106 @@ class MLPBlock(nn.Module):
             dtype=dtype,
         )
 
-    def run_einsum_fused(
+    def __dequantize_mxfp4_weight(
+        self,
+        blocks: nn.Tensor,
+        scales: nn.Tensor,
+        rows_per_chunk: int | None = None,  # unused, kept for compatibility
+    ) -> nn.Tensor:
+        import numpy as np
+
+        if rows_per_chunk is None:
+            rows_per_chunk = 16384 * 512
+        scales = scales.astype("int32") - 127
+        assert blocks.shape[:-1] == scales.shape, f"{blocks.shape=} does not match {scales.shape=}"
+        out_dtype = self.dtype
+
+        lut = nn.Tensor.from_const(np.array(FP4_VALUES, dtype=out_dtype))
+
+        *prefix_shape, group_size, bytes_per_block = blocks.shape
+        total_rows = prod(prefix_shape) * group_size
+
+        blocks = blocks.reshape(total_rows, bytes_per_block)
+        scales = scales.reshape(total_rows, 1)
+
+        # Process multiple rows per block for better GPU utilization
+        rows_per_block = 8
+        num_blocks = (total_rows + rows_per_block - 1) // rows_per_block
+
+        @T.prim_func(private=True)
+        def dequant_kernel(
+            blocks_handle: T.handle,
+            scales_handle: T.handle,
+            lut_handle: T.handle,
+            out_handle: T.handle,
+        ):
+            T.func_attr({"tir.noalias": True, "tir.is_scheduled": 1})
+            blocks_buf = T.match_buffer(blocks_handle, (total_rows, bytes_per_block), "uint8")
+            scales_buf = T.match_buffer(scales_handle, (total_rows, 1), "int32")
+            lut_buf = T.match_buffer(lut_handle, (16,), out_dtype)
+            out_buf = T.match_buffer(out_handle, (total_rows, 2 * bytes_per_block), out_dtype)
+
+            # Shared memory for LUT (16 values) and cached exp2 scales (per row)
+            lut_shared = T.alloc_buffer((16,), out_dtype, scope="shared")
+            scale_shared = T.alloc_buffer((rows_per_block,), "float32", scope="shared")
+
+            with T.block("init_dequantize"):
+                for block_idx in T.thread_binding(num_blocks, thread="blockIdx.x"):
+                    for local_idx in T.thread_binding(rows_per_block * bytes_per_block, thread="threadIdx.x"):
+                        # Load LUT into shared memory (first 16 threads)
+                        with T.block("load_lut"):
+                            vblock, vlocal = T.axis.remap("SS", [block_idx, local_idx])
+                            if vlocal < 16:
+                                lut_shared[vlocal] = lut_buf[vlocal]
+
+                        # Load and compute exp2 scales into shared memory (one per row)
+                        with T.block("load_scales"):
+                            vblock, vlocal = T.axis.remap("SS", [block_idx, local_idx])
+                            local_row = vlocal // bytes_per_block
+                            is_first_in_row = (vlocal % bytes_per_block) == 0
+                            vi = vblock * rows_per_block + local_row
+                            if is_first_in_row and vi < total_rows:
+                                exp_val = scales_buf[vi, 0]
+                                scale_shared[local_row] = T.exp2(T.cast(exp_val, "float32"))
+
+                        # Sync threads to ensure shared memory is populated
+                        with T.block("sync"):
+                            T.evaluate(0)
+
+                        # Main dequantization using shared memory
+                        with T.block("run_dequantize"):
+                            vblock, vlocal = T.axis.remap("SS", [block_idx, local_idx])
+                            local_row = vlocal // bytes_per_block
+                            vj = vlocal % bytes_per_block
+                            vi = vblock * rows_per_block + local_row
+
+                            if vi < total_rows:
+                                block_val = blocks_buf[vi, vj]
+                                ldexp_scale = scale_shared[local_row]
+
+                                idx_low = T.cast(block_val & T.uint8(0x0F), "int64")
+                                idx_high = T.cast(block_val >> T.uint8(4), "int64")
+
+                                out_buf[vi, 2 * vj] = lut_shared[idx_low] * ldexp_scale
+                                out_buf[vi, 2 * vj + 1] = lut_shared[idx_high] * ldexp_scale
+
+        out = nn.tensor_ir_op(
+            dequant_kernel,
+            "dequant_mxfp4",
+            args=[blocks, scales, lut],
+            out=nn.Tensor.placeholder((total_rows, 2 * bytes_per_block), dtype=out_dtype),
+        )
+
+        return out.reshape(*prefix_shape, 2 * group_size * bytes_per_block)
+
+    def run_einsum(
         self,
         input_tensor: nn.Tensor,
         expert_indices: nn.Tensor,
         weight_blocks: nn.Tensor,
         weight_scales: nn.Tensor,
         bias_tensor: nn.Tensor,
+        safetensor_dtype: str | None = None,
     ) -> nn.Tensor:
         """Fused einsum with on-the-fly MXFP4 dequantization.
 
@@ -238,7 +329,7 @@ class MLPBlock(nn.Module):
         self,
         input_tensor: nn.Tensor,
         expert_weights: nn.Tensor,
-        out_dtype: Optional[str] = None,
+        out_dtype: str | None = None,
     ):
         # f32 -> out_dtype
         seq_len, experts_per_token, out_features = input_tensor.shape
@@ -246,37 +337,29 @@ class MLPBlock(nn.Module):
         if out_dtype is None:
             out_dtype = self.dtype
 
-        THREADS_PER_BLOCK = 256
-
         @T.prim_func(private=True)
         def _apply_gate(
             x_handle: T.handle,
-            e_weights_handle: T.handle,
+            e_weights: T.Buffer((seq_len, experts_per_token), out_dtype),
             out_handle: T.handle,
         ):
-            seq_len_val = T.int32(is_size_var=True)
-            T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
-            e_weights = T.match_buffer(e_weights_handle, (seq_len_val, experts_per_token), out_dtype)
-            x = T.match_buffer(x_handle, (seq_len_val, experts_per_token, out_features), input_tensor.dtype)
-            out = T.match_buffer(out_handle, (seq_len_val, out_features), out_dtype)
+            T.func_attr({"op_pattern": 4, "tir.noalias": True})
+            x = T.match_buffer(x_handle, (seq_len, experts_per_token, out_features), input_tensor.dtype)
+            out = T.match_buffer(out_handle, (seq_len, out_features), out_dtype)
 
-            gate_buffer = T.alloc_buffer((1,), dtype=block_dtype, scope="local")
+            for s, c in T.grid(seq_len, out_features):
+                with T.block("apply_gate"):
+                    seq_idx, out_idx = T.axis.remap("SS", [s, c])
 
-            for block_idx in T.thread_binding(seq_len_val, thread="blockIdx.x"):
-                for thread_idx in T.thread_binding(THREADS_PER_BLOCK, thread="threadIdx.x"):
-                    seq_idx = block_idx
+                    gate_buffer = T.alloc_buffer((1,), dtype=block_dtype, scope="local")
+                    gate_buffer[0] = T.cast(0.0, block_dtype)
 
-                    for out_offset in T.serial(T.ceildiv(out_features, THREADS_PER_BLOCK)):
-                        out_idx = thread_idx + out_offset * THREADS_PER_BLOCK
-                        if out_idx < out_features:
-                            gate_buffer[0] = T.cast(0.0, block_dtype)
+                    for expert_rank in T.serial(experts_per_token):
+                        gate_buffer[0] += T.cast(x[seq_idx, expert_rank, out_idx], block_dtype) * T.cast(
+                            e_weights[seq_idx, expert_rank], block_dtype
+                        )
 
-                            for expert_rank in T.serial(experts_per_token):
-                                gate_buffer[0] += T.cast(x[seq_idx, expert_rank, out_idx], block_dtype) * T.cast(
-                                    e_weights[seq_idx, expert_rank], block_dtype
-                                )
-
-                            out[seq_idx, out_idx] = T.cast(gate_buffer[0], out_dtype)
+                    out[seq_idx, out_idx] = T.cast(gate_buffer[0], out_dtype)
 
         return nn.tensor_ir_op(
             _apply_gate,
@@ -292,19 +375,24 @@ class MLPBlock(nn.Module):
         t = self.norm(x)  # t: (seq_len, 2880)
         g = self.gate(t)  # g: (seq_len, 32)
 
+        # here, type: (Tensor, Tensor)
+        # top_k is 4
         # expert_indices: (seq_len, top_k)
         expert_weights, expert_indices = nn.op.topk(g, k=self.experts_per_token, axis=-1, largest=True)
         expert_weights = nn.op.softmax(expert_weights, axis=1)
-        expert_indices = expert_indices.astype("int32")
 
         # MLP #1
-        t = self.run_einsum_fused(
+        # self.mlp1_weight: (32, 5760, 2880)
+        # self.mlp1_bias: (32, 5760)
+        t = self.run_einsum(
             t, expert_indices, self.mlp1_weight_blocks, self.mlp1_weight_scales, self.mlp1_bias
-        )  # (seq_len, top_k, 2880)
+        )  # (seq_len, top_k, 5760)
         t = swiglu(t, limit=self.swiglu_limit, out_dtype="float32")  # (seq_len, top_k, 2880)
 
         # MLP #2
-        t = self.run_einsum_fused(t, expert_indices, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias)
+        # self.mlp2_weight: (32, 2880, 2880)
+        # self.mlp2_bias: (32, 2880)
+        t = self.run_einsum(t, expert_indices, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias)
 
         # Weighted sum of experts
         t = self.run_gating(t, expert_weights)

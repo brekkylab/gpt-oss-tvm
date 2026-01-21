@@ -8,7 +8,7 @@ from tvm.relax.frontend.nn import Tensor, op
 
 from .attention import AttentionBlock
 from .config import GPTOssConfig
-from .mlp_v2 import MLPBlock as MLPBlockV2
+from .mlp import MLPBlock
 
 
 class TransformerBlock(nn.Module):
@@ -17,8 +17,7 @@ class TransformerBlock(nn.Module):
         if dtype is None:
             dtype = config.dtype
         self.attn = AttentionBlock(config, layer_idx, dtype=dtype)
-        # self.mlp = MLPBlockV1(config, dtype=dtype)
-        self.mlp = MLPBlockV2(config, dtype=dtype)
+        self.mlp = MLPBlock(config, dtype=dtype)
 
     def forward(
         self,

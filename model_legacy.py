@@ -674,7 +674,7 @@ class MLPBlock(nn.Module):
         # MLP #1
         # self.mlp1_weight: (32, 5760, 2880)
         # self.mlp1_bias: (32, 5760)
-        t = self.run_einsum_fused(
+        t = self.run_einsum(
             t, expert_indices, self.mlp1_weight_blocks, self.mlp1_weight_scales, self.mlp1_bias
         )  # (seq_len, top_k, 5760)
         t = swiglu(t, limit=self.swiglu_limit, out_dtype="float32")  # (seq_len, top_k, 2880)
@@ -682,7 +682,7 @@ class MLPBlock(nn.Module):
         # MLP #2
         # self.mlp2_weight: (32, 2880, 2880)
         # self.mlp2_bias: (32, 2880)
-        t = self.run_einsum_fused(t, expert_indices, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias)
+        t = self.run_einsum(t, expert_indices, self.mlp2_weight_blocks, self.mlp2_weight_scales, self.mlp2_bias)
 
         # Weighted sum of experts
         t = self.run_gating(t, expert_weights)

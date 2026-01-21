@@ -72,24 +72,25 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
                     "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
                     "provided in `config.json`."
                 )
-            if self.num_key_value_heads == 0:
-                self.num_key_value_heads = self.num_attention_heads
-            if self.head_dim == 0:
-                self.head_dim = self.hidden_size // self.num_attention_heads
-            assert self.num_attention_heads % self.num_key_value_heads == 0
-            # TODO: need to check `8192`; to another value
-            if self.prefill_chunk_size == 0:
-                self.prefill_chunk_size = min(self.context_window_size, 8192)
-                logger.info(
-                    "%s defaults to %d",
-                    bold("prefill_chunk_size"),
-                    self.prefill_chunk_size,
-                )
-            elif self.prefill_chunk_size > self.context_window_size:
-                logger.info(
-                    "Overriding %s from %d to %d",
-                    bold("prefill_chunk_size"),
-                    self.prefill_chunk_size,
-                    min(self.context_window_size, 8192),
-                )
-                self.prefill_chunk_size = min(self.context_window_size, 8192)
+
+        if self.num_key_value_heads == 0:
+            self.num_key_value_heads = self.num_attention_heads
+        if self.head_dim == 0:
+            self.head_dim = self.hidden_size // self.num_attention_heads
+        assert self.num_attention_heads % self.num_key_value_heads == 0
+
+        if self.prefill_chunk_size == 0:
+            self.prefill_chunk_size = min(self.context_window_size, 8192)
+            logger.info(
+                "%s defaults to %d",
+                bold("prefill_chunk_size"),
+                self.prefill_chunk_size,
+            )
+        elif self.prefill_chunk_size > self.context_window_size:
+            logger.info(
+                "Overriding %s from %d to %d",
+                bold("prefill_chunk_size"),
+                self.prefill_chunk_size,
+                min(self.context_window_size, 8192),
+            )
+            self.prefill_chunk_size = min(self.context_window_size, 8192)

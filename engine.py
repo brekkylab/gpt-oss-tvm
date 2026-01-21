@@ -1,7 +1,7 @@
+import gc
 import re
-import time
 from pathlib import Path
-from typing import Callable, Literal, Sequence
+from typing import Literal, Sequence
 
 import mlc_llm.compiler_pass  # noqa: F401
 import numpy as np
@@ -10,8 +10,7 @@ import tvm
 import tvm_ffi
 from safetensors import safe_open
 from torch.utils.dlpack import to_dlpack
-
-# from tqdm import tqdm
+from tqdm import tqdm
 from tvm import relax, runtime
 from tvm.relax.frontend import nn
 from tvm.runtime import Device as TVMDevice
@@ -82,20 +81,22 @@ def load_original_safetensors(
     torch_device = to_pytorch_device(device) if device is not None else "cpu"
     with safe_open(st_path, framework="pt", device=torch_device) as f:
         filtered_keys = [k for k in list(f.keys()) if include_key_with_pattern(k)]
-        for name in filtered_keys:
-            # for name in tqdm(filtered_keys, desc="Loading params"):
+        for name in tqdm(filtered_keys, desc="Loading params"):
             torch_tensor: torch.Tensor = f.get_tensor(name)
             if "blocks" in name or "scales" in name:
                 # MXFP4: uint8
                 torch_tensor = torch_tensor.to(torch.uint8)
                 # Transpose for memory coalescing (move N dimension to the end)
-                if torch_tensor.ndim == 4:  # blocks: (E, N, group, b) -> (E, group, b, N)
-                    torch_tensor = torch_tensor.permute(0, 2, 3, 1).contiguous()
-                elif torch_tensor.ndim == 3:  # scales: (E, N, group) -> (E, group, N)
-                    torch_tensor = torch_tensor.permute(0, 2, 1).contiguous()
+                # if torch_tensor.ndim == 4:  # blocks: (E, N, group, b) -> (E, group, b, N)
+                #     torch_tensor = torch_tensor.permute(0, 2, 3, 1).contiguous()
+                # elif torch_tensor.ndim == 3:  # scales: (E, N, group) -> (E, group, N)
+                #     torch_tensor = torch_tensor.permute(0, 2, 1).contiguous()
 
             tvm_tensor = tvm.runtime.from_dlpack(to_dlpack(torch_tensor))
             tvm_params[name] = tvm_tensor
+
+            # Prevent memory pressure
+            gc.collect()
 
     return tvm_params
 
@@ -150,8 +151,7 @@ class Engine:
     def __init__(
         self,
         model_path: str | Path,
-        target: Literal["cpu", "llvm", "metal", "vulkan", "cuda"] = "metal",
-        dump_metal_path: str | Path | None = None,
+        target: str,
     ):
         self.model_path = Path(model_path)
         self.config = GPTOssConfig.from_file(self.model_path / "config.json")
@@ -160,8 +160,6 @@ class Engine:
 
         # compile
         ex, params = self._compile_module(target)
-        if dump_metal_path:
-            self._dump_metal_source(ex, Path(dump_metal_path))
 
         # load model
         self._vm = relax.VirtualMachine(ex, self.device, profile=False)
@@ -186,7 +184,6 @@ class Engine:
         self._f_end_forward = tvm.get_global_func("vm.builtin.kv_state_end_forward")
 
         self.paged_kv_cache = self._create_paged_kv_cache()
-        self.clear_kv_cache()
         self._warmup()
 
     def _compile_module(
@@ -223,60 +220,25 @@ class Engine:
                     "batch_size": 1,
                 },
             )
+            print("Applying pipeline..")
             mod = pipeline(irmodule)
-            print("Pipeline applied.")
 
+            print("Compiling..")
             ex = tvm.compile(mod, target)
-        print("Compile Done.")
+
         return ex, params
-
-    def _dump_metal_source(self, ex: relax.VMExecutable, path: Path):
-        def find_metal(m, seen=None):
-            if seen is None:
-                seen = set()
-            if m in seen:
-                return None
-            seen.add(m)
-
-            try:
-                if hasattr(m, "inspect_source"):
-                    src = m.inspect_source()
-                    if src and "#include <metal_stdlib>" in src:
-                        return m
-            except Exception:
-                pass
-
-            try:
-                sub_mods = []
-                if hasattr(m, "imports"):
-                    sub_mods = m.imports
-                elif hasattr(m, "imports_"):
-                    sub_mods = m.imports_()
-
-                for sub in sub_mods:
-                    res = find_metal(sub, seen)
-                    if res:
-                        return res
-            except Exception:
-                pass
-            return None
-
-        metal_mod = find_metal(ex.mod)
-        if metal_mod:
-            source = metal_mod.inspect_source()
-            with open(path, "w") as f:
-                f.write(source)
-            print(f"Metal source saved to {path}")
-        else:
-            print("No Metal module found to dump.")
 
     def _create_paged_kv_cache(self):
         # TODO: replace hard-coded values
         # TODO: for now, config value causes `buf != nil` error
         return self._f_create_kv_cache(  # pylint: disable=too-many-arguments
             tvm.runtime.ShapeTuple([1]),  # max_batch_size
-            tvm.runtime.ShapeTuple([8192]),  # max_total_seq_len: self.config.context_window_size
-            tvm.runtime.ShapeTuple([8192]),  # prefill_chunk_size: self.config.prefill_chunk_size
+            tvm.runtime.ShapeTuple(
+                [self.config.context_window_size]
+            ),  # max_total_seq_len: self.config.context_window_size
+            tvm.runtime.ShapeTuple(
+                [self.config.prefill_chunk_size]
+            ),  # prefill_chunk_size: self.config.prefill_chunk_size
             tvm.runtime.ShapeTuple([16]),  # page_size
             tvm.runtime.ShapeTuple([1]),  # support_sliding_window
         )
@@ -303,25 +265,6 @@ class Engine:
             )
         return seq_id
 
-    def forward(
-        self,
-        input_tokens: np.ndarray,
-        f_forward: Callable,
-        sequence_id: int = 0,
-    ) -> tvm_ffi.Tensor:
-        input_embed: tvm_ffi.Tensor = self._f_embed(tvm.runtime.tensor(input_tokens, device=self.device), self.params)
-        input_length = input_embed.shape[1]
-
-        self._f_begin_forward(
-            self.paged_kv_cache,
-            tvm.runtime.ShapeTuple([sequence_id]),  # sequence id
-            tvm.runtime.ShapeTuple([input_length]),  # added all tokens to kv cache
-        )
-        logits, self.paged_kv_cache = f_forward(input_embed, self.paged_kv_cache, self.params)
-        self._f_end_forward(self.paged_kv_cache)
-
-        return logits
-
     def prefill(
         self,
         input_tokens: np.ndarray,
@@ -336,13 +279,7 @@ class Engine:
             tvm.runtime.ShapeTuple([sequence_id]),  # sequence id
             tvm.runtime.ShapeTuple([input_length]),  # added all tokens to kv cache
         )
-        start_time = time.perf_counter()
-        # result = self._vm.profile("prefill", input_embed, self.paged_kv_cache, self.params)
-        # print(result)
         logits, self.paged_kv_cache = self._f_prefill(input_embed, self.paged_kv_cache, self.params)
-        end_time = time.perf_counter()
-        print(f"prefill: {end_time - start_time}s")
-        # logits = self.forward(input_tokens, self._f_prefill, sequence_id)
         self._f_end_forward(self.paged_kv_cache)
         return logits
 
@@ -359,23 +296,16 @@ class Engine:
             tvm.runtime.ShapeTuple([sequence_id]),  # sequence id
             tvm.runtime.ShapeTuple([1]),  # added all tokens to kv cache
         )
-        start_time = time.perf_counter()
-        # result = self._vm.profile("decode", input_embed, self.paged_kv_cache, self.params)
-        # print(result)
         logits, self.paged_kv_cache = self._f_decode(input_embed, self.paged_kv_cache, self.params)
-        end_time = time.perf_counter()
-        print(f"decode: {end_time - start_time}s")
         self._f_end_forward(self.paged_kv_cache)
-        # logits = self.forward(input_tokens, self._f_decode, sequence_id)
         return logits
 
     def sample(self, logits: tvm_ffi.Tensor) -> int:
-        start_time = time.perf_counter()
         new_token_id: int = self._f_sample(logits, *self.sample_parameters.values())
-        # print(f"sample: {time.perf_counter() - start_time}s")
         return new_token_id
 
     def _warmup(self):
+        print("Warming up..")
         dummy_input = np.array([0], dtype="int32")
         seq_id = self.begin_sequence()
         self.prefill(dummy_input, seq_id)

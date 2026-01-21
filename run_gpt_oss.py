@@ -47,10 +47,10 @@ def decode_tokens(tokens: list[int]):
         print("current_content", stream.current_content)
 
 
-def main(max_token_number: int = 64):
+def main(max_token_number: int = 512):
     model_path = Path.cwd() / "gpt-oss-20b" / "original"
 
-    engine = Engine(model_path, dump_metal_path="generated_kernel.metal")
+    engine = Engine(model_path, target="metal")
 
     seq_id = engine.begin_sequence()
 
@@ -61,25 +61,19 @@ def main(max_token_number: int = 64):
     input_tokens = get_input_tokens()
     prefill_logits = engine.prefill(input_tokens, seq_id)
     sampled_token = engine.sample(prefill_logits)
-    print(f"token: {sampled_token}, decoded: {enc.decode([sampled_token])}")
+    print(enc.decode([sampled_token]), end="", flush=True)
     generated_tokens.append(sampled_token)
 
     # decode stage
-    # token_tensor = np.array([input_tokens[-1]], dtype=np.int32)
-    # engine.decode(token_tensor, seq_id)
-
     while len(generated_tokens) < max_token_number:
         token_tensor = np.array([sampled_token], dtype=np.int32)
         decode_logits = engine.decode(token_tensor, seq_id)
         sampled_token = engine.sample(decode_logits)
-        print(f"token: {sampled_token}, decoded: {enc.decode([sampled_token])}")
+        print(enc.decode([sampled_token]), end="", flush=True)
         generated_tokens.append(sampled_token)
         if sampled_token in stop_token_ids:
-            print("Got a stop token.")
             break
-
-    # return decode_tokens(generated_tokens)
 
 
 if __name__ == "__main__":
-    print(main())
+    main()
