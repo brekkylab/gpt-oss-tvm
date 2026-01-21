@@ -1,5 +1,3 @@
-from math import prod
-
 from mlc_llm.op.moe_misc import gating_softmax_topk
 from tvm import relax
 from tvm.relax.frontend import nn
@@ -240,11 +238,15 @@ class MLPBlock(nn.Module):
         expert_weights: nn.Tensor,
         out_dtype: str | None = None,
     ):
-        # f32 -> out_dtype
+
         seq_len, experts_per_token, out_features = input_tensor.shape
         block_dtype = "float32"
         if out_dtype is None:
             out_dtype = self.dtype
+
+        tokens_per_block = 4
+        threads_per_block = 128
+        out_tile_size = 128
 
         @T.prim_func(private=True)
         def _apply_gate(
@@ -252,23 +254,58 @@ class MLPBlock(nn.Module):
             e_weights: T.Buffer((seq_len, experts_per_token), out_dtype),
             out_handle: T.handle,
         ):
-            T.func_attr({"op_pattern": 4, "tir.noalias": True})
+            T.func_attr({"op_pattern": 4, "tir.noalias": True, "tir.is_scheduled": 1})
             x = T.match_buffer(x_handle, (seq_len, experts_per_token, out_features), input_tensor.dtype)
             out = T.match_buffer(out_handle, (seq_len, out_features), out_dtype)
 
-            for s, c in T.grid(seq_len, out_features):
-                with T.block("apply_gate"):
-                    seq_idx, out_idx = T.axis.remap("SS", [s, c])
+            # Thread binding
+            for out_block_idx in T.thread_binding(
+                (out_features + out_tile_size - 1) // out_tile_size, thread="blockIdx.x"
+            ):
+                for token_block_idx in T.thread_binding(
+                    (seq_len + tokens_per_block - 1) // tokens_per_block, thread="blockIdx.y"
+                ):
+                    for thread_idx in T.thread_binding(threads_per_block, thread="threadIdx.x"):
+                        with T.block("apply_gate"):
+                            out_idx = out_block_idx * out_tile_size + thread_idx
 
-                    gate_buffer = T.alloc_buffer((1,), dtype=block_dtype, scope="local")
-                    gate_buffer[0] = T.cast(0.0, block_dtype)
+                            weights_shared = T.alloc_buffer(
+                                (tokens_per_block, experts_per_token), block_dtype, scope="shared"
+                            )
 
-                    for expert_rank in T.serial(experts_per_token):
-                        gate_buffer[0] += T.cast(x[seq_idx, expert_rank, out_idx], block_dtype) * T.cast(
-                            e_weights[seq_idx, expert_rank], block_dtype
-                        )
+                            # Local accumulators
+                            gate_buffer = T.alloc_buffer((tokens_per_block,), block_dtype, scope="local")
 
-                    out[seq_idx, out_idx] = T.cast(gate_buffer[0], out_dtype)
+                            if thread_idx < tokens_per_block * experts_per_token:
+                                load_token = thread_idx // experts_per_token
+                                load_expert = thread_idx % experts_per_token
+                                token_idx = token_block_idx * tokens_per_block + load_token
+                                if token_idx < seq_len:
+                                    weights_shared[load_token, load_expert] = T.cast(
+                                        e_weights[token_idx, load_expert], block_dtype
+                                    )
+                                else:
+                                    weights_shared[load_token, load_expert] = T.float32(0.0)
+
+                            T.tvm_storage_sync("shared")
+
+                            for local_token in T.unroll(tokens_per_block):
+                                gate_buffer[local_token] = T.float32(0.0)
+
+                            if out_idx < out_features:
+                                for local_token in T.unroll(tokens_per_block):
+                                    token_idx = token_block_idx * tokens_per_block + local_token
+                                    if token_idx < seq_len:
+                                        for expert_rank in T.serial(experts_per_token):
+                                            gate_buffer[local_token] += (
+                                                T.cast(x[token_idx, expert_rank, out_idx], block_dtype)
+                                                * weights_shared[local_token, expert_rank]
+                                            )
+
+                            for local_token in T.unroll(tokens_per_block):
+                                token_idx = token_block_idx * tokens_per_block + local_token
+                                if token_idx < seq_len and out_idx < out_features:
+                                    out[token_idx, out_idx] = T.cast(gate_buffer[local_token], out_dtype)
 
         return nn.tensor_ir_op(
             _apply_gate,
@@ -287,8 +324,7 @@ class MLPBlock(nn.Module):
         # here, type: (Tensor, Tensor)
         # top_k is 4
         # expert_indices: (seq_len, top_k)
-        expert_weights, expert_indices = nn.op.topk(g, k=self.experts_per_token, axis=-1, largest=True)
-        expert_weights = nn.op.softmax(expert_weights, axis=1)
+        expert_weights, expert_indices = gating_softmax_topk(g, k=self.experts_per_token)
 
         # MLP #1
         # self.mlp1_weight: (32, 5760, 2880)
