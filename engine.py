@@ -8,17 +8,13 @@ from tvm import relax
 from tvm.target import Target
 
 from model import GPTOssConfig, GPTOssForCausalLM
-from weights import TVMCheckpoint
+from weights import TVMCheckpoint, TVMDeviceStr
 
 
 class Engine:
     next_seq_id = 0
 
-    def __init__(
-        self,
-        model_path: str | Path,
-        target: str,
-    ):
+    def __init__(self, model_path: str | Path, target: TVMDeviceStr):
         self.model_path = Path(model_path)
         self.config = GPTOssConfig.from_file(self.model_path / "config.json")
         self.model = GPTOssForCausalLM(self.config)
@@ -52,10 +48,7 @@ class Engine:
         self.paged_kv_cache = self._create_paged_kv_cache()
         self._warmup()
 
-    def _compile_module(
-        self,
-        target: str,
-    ):
+    def _compile_module(self, target: TVMDeviceStr):
         irmodule, params, _ = self.model.export_tvm(  # type: ignore[misc]
             spec=self.model.get_default_spec(),
             allow_extern=True,
@@ -110,11 +103,7 @@ class Engine:
     def clear_kv_cache(self):
         self._f_kv_cache_clear(self.paged_kv_cache)
 
-    def begin_sequence(
-        self,
-        sliding_window_size: int = None,
-        sink_size: int = None,
-    ):
+    def begin_sequence(self, sliding_window_size: int = None, sink_size: int = None):
         seq_id = self.__class__.next_seq_id
         self.__class__.next_seq_id += 1
         self._f_add_sequence(self.paged_kv_cache, seq_id)
@@ -129,11 +118,7 @@ class Engine:
             )
         return seq_id
 
-    def prefill(
-        self,
-        input_tokens: np.ndarray,
-        sequence_id: int = 0,
-    ) -> tvm_ffi.Tensor:
+    def prefill(self, input_tokens: np.ndarray, sequence_id: int = 0) -> tvm_ffi.Tensor:
         input_tokens = tvm.runtime.tensor(input_tokens, device=self.device)
         input_embed: tvm_ffi.Tensor = self._f_embed(input_tokens, self.params)
         input_length = input_embed.shape[1]
@@ -147,11 +132,7 @@ class Engine:
         self._f_end_forward(self.paged_kv_cache)
         return logits
 
-    def decode(
-        self,
-        input_tokens: np.ndarray,
-        sequence_id: int = 0,
-    ) -> tvm_ffi.Tensor:
+    def decode(self, input_tokens: np.ndarray, sequence_id: int = 0) -> tvm_ffi.Tensor:
         input_tokens = tvm.runtime.tensor(input_tokens, device=self.device)
         input_embed: tvm_ffi.Tensor = self._f_embed(input_tokens, self.params)
 
