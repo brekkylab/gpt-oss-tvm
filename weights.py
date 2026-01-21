@@ -1,3 +1,4 @@
+import gc
 from pathlib import Path
 from typing import Literal
 
@@ -47,32 +48,29 @@ PARAM_NAME_MAP = (
     }
 )
 
+TVMDeviceStr = Literal["cuda", "metal", "rocm", "vulkan", "opencl", "cpu"]
+TorchDeviceStr = Literal["cuda", "mps", "vulkan", "opencl", "cpu"]
 
-def tvm_device_to_pytorch_device(device: TVMDevice) -> Literal["cpu", "cuda", "vulkan", "mps", "xpu", "unknown"]:
+
+def tvm_device_to_pytorch_device(device: TVMDevice) -> TorchDeviceStr | None:
     mapping = {
         DLDeviceType.kDLCPU.value: "cpu",
         DLDeviceType.kDLCUDA.value: "cuda",
         DLDeviceType.kDLCUDAHost.value: "cpu",
+        DLDeviceType.kDLOpenCL.value: "opencl",
         DLDeviceType.kDLVulkan.value: "vulkan",
         DLDeviceType.kDLMetal.value: "mps",
         DLDeviceType.kDLROCM.value: "cuda",  # PyTorch aliases this to cuda
         DLDeviceType.kDLROCMHost.value: "cpu",
         DLDeviceType.kDLCUDAManaged.value: "cuda",
-        DLDeviceType.kDLOneAPI.value: "xpu",
     }
-    return mapping.get(device.dlpack_device_type(), "unknown")
+    return mapping.get(device.dlpack_device_type(), None)
 
 
 class TVMCheckpoint:
-    def __init__(
-        self,
-        path: str | Path,
-        target_device: Literal["cpu", "llvm", "metal", "vulkan", "cuda"] = "cpu",
-    ):
+    def __init__(self, path: str | Path, target_device: TVMDeviceStr = "cpu"):
         self.path = Path(path)
-        self.device_str = "llvm" if target_device == "cpu" else target_device
-        self.device = tvm.device(self.device_str)
-
+        self.device = tvm.device(target_device)
         self.tvm_params = self._load_safetensors()
 
     def _load_safetensors(self) -> dict[str, tvm_ffi.Tensor]:
@@ -91,6 +89,10 @@ class TVMCheckpoint:
                     torch_tensor = torch_tensor.to(torch.uint8)
                 tvm_tensor = tvm.runtime.from_dlpack(to_dlpack(torch_tensor))
                 tvm_params[name] = tvm_tensor
+
+                # prevent memory pressure
+                gc.collect()
+
         return tvm_params
 
     def get_tvm_tensor(self, name: str) -> tvm_ffi.Tensor:

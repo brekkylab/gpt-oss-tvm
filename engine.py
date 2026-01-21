@@ -1,158 +1,20 @@
-import gc
-import re
 from pathlib import Path
-from typing import Literal, Sequence
 
 import mlc_llm.compiler_pass  # noqa: F401
 import numpy as np
-import torch
 import tvm
 import tvm_ffi
-from safetensors import safe_open
-from torch.utils.dlpack import to_dlpack
-from tqdm import tqdm
-from tvm import relax, runtime
-from tvm.relax.frontend import nn
-from tvm.runtime import Device as TVMDevice
+from tvm import relax
 from tvm.target import Target
-from tvm_ffi import DLDeviceType
 
 from model import GPTOssConfig, GPTOssForCausalLM
-
-# Map the names assumed in this implementation to the checkpoint names.
-PARAM_NAME_MAP = (
-    {f"block.{n}.mlp.mlp1_bias": f"block.{n}.mlp.mlp1_bias" for n in range(36)}
-    | {
-        f"block.{n}.mlp.mlp1_weight": (f"block.{n}.mlp.mlp1_weight.blocks", f"block.{n}.mlp.mlp1_weight.scales")
-        for n in range(36)
-    }
-    | {f"block.{n}.mlp.mlp2_bias": f"block.{n}.mlp.mlp2_bias" for n in range(36)}
-    | {
-        f"block.{n}.mlp.mlp2_weight": (f"block.{n}.mlp.mlp2_weight.blocks", f"block.{n}.mlp.mlp2_weight.scales")
-        for n in range(36)
-    }
-)
-
-
-def to_pytorch_device(device: TVMDevice):
-    mapping = {
-        DLDeviceType.kDLCPU.value: "cpu",
-        DLDeviceType.kDLCUDA.value: "cuda",
-        DLDeviceType.kDLCUDAHost.value: "cpu",
-        DLDeviceType.kDLVulkan.value: "vulkan",
-        DLDeviceType.kDLMetal.value: "mps",
-        DLDeviceType.kDLROCM.value: "cuda",  # PyTorch aliases this to cuda
-        DLDeviceType.kDLCUDAManaged.value: "cuda",
-        DLDeviceType.kDLOneAPI.value: "xpu",
-    }
-    return mapping.get(device.dlpack_device_type(), "unknown")
-
-
-def load_original_safetensors(
-    st_path: Path,
-    block_indices: Sequence[int] | None = None,
-    include_unnumbered_blocks: bool = True,
-    key_pattern: str = r"block\.(\d+)\.",
-    device: runtime.Device | None = None,
-):
-    st_path = Path(st_path) / "model.safetensors" if st_path.suffix != ".safetensors" else st_path
-    if not st_path.exists():
-        raise FileNotFoundError(
-            f"safetensor not found: {st_path}\n"
-            f"please run: `hf download openai/gpt-oss-20b --local-dir {st_path.parent}`"
-        )
-
-    block_indices = set(block_indices) if block_indices else None
-
-    def include_key_with_pattern(key_name: str) -> bool:
-        if block_indices is None:
-            result = True
-
-        else:
-            matched = re.search(key_pattern, key_name)
-            if matched:
-                result = int(matched.group(1)) in block_indices
-            else:
-                result = include_unnumbered_blocks
-
-        return result
-
-    tvm_params: dict[str, tvm_ffi.Tensor] = {}
-    torch_device = to_pytorch_device(device) if device is not None else "cpu"
-    with safe_open(st_path, framework="pt", device=torch_device) as f:
-        filtered_keys = [k for k in list(f.keys()) if include_key_with_pattern(k)]
-        for name in tqdm(filtered_keys, desc="Loading params"):
-            torch_tensor: torch.Tensor = f.get_tensor(name)
-            if "blocks" in name or "scales" in name:
-                # MXFP4: uint8
-                torch_tensor = torch_tensor.to(torch.uint8)
-                # Transpose for memory coalescing (move N dimension to the end)
-                # if torch_tensor.ndim == 4:  # blocks: (E, N, group, b) -> (E, group, b, N)
-                #     torch_tensor = torch_tensor.permute(0, 2, 3, 1).contiguous()
-                # elif torch_tensor.ndim == 3:  # scales: (E, N, group) -> (E, group, N)
-                #     torch_tensor = torch_tensor.permute(0, 2, 1).contiguous()
-
-            tvm_tensor = tvm.runtime.from_dlpack(to_dlpack(torch_tensor))
-            tvm_params[name] = tvm_tensor
-
-            # Prevent memory pressure
-            gc.collect()
-
-    return tvm_params
-
-
-class TVMCheckpoint:
-    def __init__(
-        self,
-        checkpoint_path: str | Path,
-        target_device: Literal["cpu", "llvm", "metal", "vulkan", "cuda"] = "cpu",
-    ):
-        self.device_str = "llvm" if target_device == "cpu" else target_device
-        self.device = tvm.device(self.device_str)
-
-        if isinstance(checkpoint_path, str):
-            checkpoint_path = Path(checkpoint_path)
-        self.tvm_params = load_original_safetensors(
-            checkpoint_path,
-            block_indices=None,
-            device=self.device,
-        )
-
-    def get_tvm_tensor(self, name: str) -> runtime.Tensor:
-        assert name in self.tvm_params, f"Tensor {name} not found in TVM shard."
-        return self.tvm_params[name]
-
-    def load_packed_params(self, params: list[tuple[str, nn.Parameter]]) -> list[runtime.Tensor]:
-        def convert_key(dict_key: str) -> str:
-            replace_tuples = [
-                ("model.", ""),
-                ("norm.weight", "norm.scale"),
-                # for MXFP4 dequantization
-                ("weight_blocks", "weight.blocks"),
-                ("weight_scales", "weight.scales"),
-            ]
-            for old, new in replace_tuples:
-                dict_key = dict_key.replace(old, new)
-            return dict_key
-
-        new_keys = [convert_key(k) for k, _ in params]
-
-        loaded_params = []
-        for k in new_keys:
-            tvm_tensor = self.get_tvm_tensor(k)
-            loaded_params.append(tvm_tensor)
-
-        return loaded_params
+from weights import TVMCheckpoint, TVMDeviceStr
 
 
 class Engine:
     next_seq_id = 0
 
-    def __init__(
-        self,
-        model_path: str | Path,
-        target: str,
-    ):
+    def __init__(self, model_path: str | Path, target: TVMDeviceStr):
         self.model_path = Path(model_path)
         self.config = GPTOssConfig.from_file(self.model_path / "config.json")
         self.model = GPTOssForCausalLM(self.config)
@@ -163,7 +25,7 @@ class Engine:
 
         # load model
         self._vm = relax.VirtualMachine(ex, self.device, profile=False)
-        self.params = TVMCheckpoint(checkpoint_path=model_path, target_device=target).load_packed_params(params)
+        self.params = TVMCheckpoint(path=model_path, target_device=target).load_packed_params(params)
 
         # get functions
         self._f_create_kv_cache = self._vm["create_tir_paged_kv_cache"]
@@ -186,10 +48,7 @@ class Engine:
         self.paged_kv_cache = self._create_paged_kv_cache()
         self._warmup()
 
-    def _compile_module(
-        self,
-        target: str,
-    ):
+    def _compile_module(self, target: TVMDeviceStr):
         irmodule, params, _ = self.model.export_tvm(  # type: ignore[misc]
             spec=self.model.get_default_spec(),
             allow_extern=True,
@@ -229,8 +88,6 @@ class Engine:
         return ex, params
 
     def _create_paged_kv_cache(self):
-        # TODO: replace hard-coded values
-        # TODO: for now, config value causes `buf != nil` error
         return self._f_create_kv_cache(  # pylint: disable=too-many-arguments
             tvm.runtime.ShapeTuple([1]),  # max_batch_size
             tvm.runtime.ShapeTuple(
@@ -246,11 +103,7 @@ class Engine:
     def clear_kv_cache(self):
         self._f_kv_cache_clear(self.paged_kv_cache)
 
-    def begin_sequence(
-        self,
-        sliding_window_size: int = None,
-        sink_size: int = None,
-    ):
+    def begin_sequence(self, sliding_window_size: int = None, sink_size: int = None):
         seq_id = self.__class__.next_seq_id
         self.__class__.next_seq_id += 1
         self._f_add_sequence(self.paged_kv_cache, seq_id)
@@ -265,11 +118,7 @@ class Engine:
             )
         return seq_id
 
-    def prefill(
-        self,
-        input_tokens: np.ndarray,
-        sequence_id: int = 0,
-    ) -> tvm_ffi.Tensor:
+    def prefill(self, input_tokens: np.ndarray, sequence_id: int = 0) -> tvm_ffi.Tensor:
         input_tokens = tvm.runtime.tensor(input_tokens, device=self.device)
         input_embed: tvm_ffi.Tensor = self._f_embed(input_tokens, self.params)
         input_length = input_embed.shape[1]
@@ -283,11 +132,7 @@ class Engine:
         self._f_end_forward(self.paged_kv_cache)
         return logits
 
-    def decode(
-        self,
-        input_tokens: np.ndarray,
-        sequence_id: int = 0,
-    ) -> tvm_ffi.Tensor:
+    def decode(self, input_tokens: np.ndarray, sequence_id: int = 0) -> tvm_ffi.Tensor:
         input_tokens = tvm.runtime.tensor(input_tokens, device=self.device)
         input_embed: tvm_ffi.Tensor = self._f_embed(input_tokens, self.params)
 
