@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Literal
 
 from mlc_llm import op as op_ext
 from mlc_llm.nn import PagedKVCache, RopeMode
