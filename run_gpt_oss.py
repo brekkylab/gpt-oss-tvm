@@ -10,7 +10,6 @@ from openai_harmony import (
     SystemContent,
     load_harmony_encoding,
 )
-from tqdm import tqdm
 
 from engine import Engine
 
@@ -48,14 +47,12 @@ def decode_tokens(tokens: list[int]):
         print("current_content", stream.current_content)
 
 
-def main(max_token_number: int = 64):
-    SLIDING_WINDOW_SIZE = 128
-
+def main(max_token_number: int = 512):
     model_path = Path.cwd() / "gpt-oss-20b" / "original"
 
-    engine = Engine(model_path)
+    engine = Engine(model_path, target="metal")
 
-    seq_id = engine.begin_sequence(sliding_window_size=SLIDING_WINDOW_SIZE)
+    seq_id = engine.begin_sequence()
 
     stop_token_ids = enc.stop_tokens_for_assistant_actions()
     generated_tokens = []
@@ -64,22 +61,19 @@ def main(max_token_number: int = 64):
     input_tokens = get_input_tokens()
     prefill_logits = engine.prefill(input_tokens, seq_id)
     sampled_token = engine.sample(prefill_logits)
+    print(enc.decode([sampled_token]), end="", flush=True)
     generated_tokens.append(sampled_token)
 
     # decode stage
-    with tqdm(range(max_token_number)) as progress_bar:
-        progress_bar.set_description("Generating tokens")
-        for _ in progress_bar:
-            token_tensor = np.array([sampled_token], dtype=np.int32)
-            decode_logits = engine.decode(token_tensor, seq_id)
-            sampled_token = engine.sample(decode_logits)
-            generated_tokens.append(sampled_token)
-            if sampled_token in stop_token_ids:
-                print("Got a stop token.")
-                break
-
-    return decode_tokens(generated_tokens)
+    while len(generated_tokens) < max_token_number:
+        token_tensor = np.array([sampled_token], dtype=np.int32)
+        decode_logits = engine.decode(token_tensor, seq_id)
+        sampled_token = engine.sample(decode_logits)
+        print(enc.decode([sampled_token]), end="", flush=True)
+        generated_tokens.append(sampled_token)
+        if sampled_token in stop_token_ids:
+            break
 
 
 if __name__ == "__main__":
-    print(main())
+    main()
