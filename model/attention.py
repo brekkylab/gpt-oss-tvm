@@ -1,6 +1,6 @@
 from functools import partial
 from math import log, pi, sqrt
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Literal
 
 from mlc_llm.nn import PagedKVCache
 from mlc_llm.support import logging
@@ -69,7 +69,7 @@ def rope_freq_yarn(
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, config: GPTOssConfig, layer_idx: int = 0, dtype: Optional[str] = None):
+    def __init__(self, config: GPTOssConfig, layer_idx: int = 0, dtype: str | None = None):
         assert config
         self.config = config
         if dtype is None:
@@ -99,13 +99,12 @@ class AttentionBlock(nn.Module):
         x: te.Tensor,
         positions: te.Tensor,
         rotary_dim: int,
-        theta: Union[float, tir.Var],
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        theta: float | tir.Var,
+        rope_scaling: dict[str, Any] | None = None,
     ):
         x_dtype = x.dtype
         if rope_scaling is None:
             rope_scaling = {
-                # "rope_type": "yarn",
                 "rope_theta": float(self.rope_theta),
                 "factor": 32.0,
                 "beta_fast": 32.0,
