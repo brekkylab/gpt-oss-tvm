@@ -2,8 +2,6 @@
 Note that this is still under construction and not ready to use for production!
 """
 
-from typing import Optional
-
 import numpy as np
 from mlc_llm.op.moe_matmul import gemv
 from mlc_llm.op.moe_misc import (
@@ -16,7 +14,6 @@ from mlc_llm.op.moe_misc import (
 )
 from tvm import tir
 from tvm.relax.frontend import nn
-from tvm.relax.frontend.nn import Tensor, op
 from tvm.script import tir as T
 
 from .config import GPTOssConfig
@@ -46,7 +43,7 @@ class MLPBlock(nn.Module):
         self,
         config: GPTOssConfig,
         rms_norm_eps: float = 1e-5,
-        dtype: Optional[str] = None,
+        dtype: str | None = None,
     ):
         assert config
         if dtype is None:
@@ -109,7 +106,7 @@ class MLPBlock(nn.Module):
         else:
             return self.forward_prefill(x, t, b, s, h, num_tokens)
 
-    def get_lut(self, dtype: str) -> Tensor:
+    def get_lut(self, dtype: str) -> nn.Tensor:
         return nn.Tensor.from_const(np.array(FP4_VALUES, dtype=dtype))
 
     def forward_prefill(self, x, t, b, s, h, num_tokens):
@@ -150,7 +147,7 @@ class MLPBlock(nn.Module):
             out=nn.Tensor.placeholder([num_tokens * k], "int32"),
         )
 
-        x_sorted = op.take(t, token_indices, axis=0).astype(self.dtype)
+        x_sorted = nn.op.take(t, token_indices, axis=0).astype(self.dtype)
 
         # Note regarding group_gemm:
         # The mlc_llm.op.moe_matmul.group_gemm / dequantize_group_gemm operators rely on
@@ -185,12 +182,12 @@ class MLPBlock(nn.Module):
         g = gemv(t, self.gate.weight.reshape(self.num_experts, 1, h), gate_indptr)
         g = g.reshape(1, self.num_experts)
         if self.gate.bias is not None:
-            g = op.add(g, self.gate.bias.reshape(1, num_experts))
+            g = nn.op.add(g, self.gate.bias.reshape(1, num_experts))
 
         expert_weights, expert_indices = gating_softmax_topk(g, k)
 
         token_expert_ids = expert_indices.reshape(k)
-        x_sorted = op.broadcast_to(t, [k, h]).astype(self.dtype)
+        x_sorted = nn.op.broadcast_to(t, [k, h]).astype(self.dtype)
 
         # Step 1: Expert-Parallel MLP1
         x_intermediate = self.mxfp4_moe_mlp1_decode(
@@ -209,12 +206,12 @@ class MLPBlock(nn.Module):
         # Step 3: Weighted Average across experts using gemv
         # (1, k) @ (k, h) -> (1, h)
         w_sum = x_expert_out.permute_dims(1, 0).reshape(1, h, k)
-        indptr_sum = op.full([1, 1], 0, dtype="int32")
+        indptr_sum = nn.op.full([1, 1], 0, dtype="int32")
         res = gemv(expert_weights.astype(self.dtype), w_sum, indptr_sum)
 
         return x + res.reshape(b, s, h).astype(self.dtype)
 
-    def mxfp4_moe_mlp1_prefill(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
+    def mxfp4_moe_mlp1_prefill(self, x, blocks, scales, bias, token_expert_ids, lut) -> nn.Tensor:
         """
         Implementation of the first MLP layer (Gate+Up projection) for the prefill phase using MXFP4 quantization.
         This kernel performs: Output = SwiGLU(X @ W_gate + b_gate, X @ W_up + b_up).
@@ -346,14 +343,14 @@ class MLPBlock(nn.Module):
                                     gv = xg / (T.float32(1.0) + T.exp(-T.float32(1.702) * xg))
                                     out_buf[vi_b * 4 + t, vj] = T.cast(gv * (xl + T.float32(1.0)), self.dtype)
 
-        return op.tensor_ir_op(
+        return nn.op.tensor_ir_op(
             _func,
             "mxfp4_moe_mlp1_prefill",
             args=[x, blocks, scales, bias, token_expert_ids, lut],
-            out=Tensor.placeholder([B_val_outer, N], self.dtype),
+            out=nn.Tensor.placeholder([B_val_outer, N], self.dtype),
         )
 
-    def mxfp4_moe_mlp2_prefill(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
+    def mxfp4_moe_mlp2_prefill(self, x, blocks, scales, bias, token_expert_ids, lut) -> nn.Tensor:
         """
         Implementation of the second MLP layer (Down projection) for the prefill phase using MXFP4 quantization.
         This kernel performs: Output = X @ W_down + b_down.
@@ -455,14 +452,14 @@ class MLPBlock(nn.Module):
                                 if (vi_b * 4 + t) < B_val and vj < N:
                                     out_buf[vi_b * 4 + t, vj] = T.cast(acc[t], self.dtype)
 
-        return op.tensor_ir_op(
+        return nn.op.tensor_ir_op(
             _func,
             "mxfp4_moe_mlp2_prefill",
             args=[x, blocks, scales, bias, token_expert_ids, lut],
-            out=Tensor.placeholder([B_val_outer, N], self.dtype),
+            out=nn.Tensor.placeholder([B_val_outer, N], self.dtype),
         )
 
-    def mxfp4_moe_mlp1_decode(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
+    def mxfp4_moe_mlp1_decode(self, x, blocks, scales, bias, token_expert_ids, lut) -> nn.Tensor:
         """
         Implementation of the first MLP layer (Gate+Up projection) for the decode phase.
         Optimized for low-latency, single-token generation.
@@ -570,10 +567,10 @@ class MLPBlock(nn.Module):
             _func,
             "mxfp4_moe_mlp1_decode",
             args=[x, blocks, scales, bias, token_expert_ids, lut],
-            out=Tensor.placeholder([4, N], self.dtype),
+            out=nn.Tensor.placeholder([4, N], self.dtype),
         )
 
-    def mxfp4_moe_mlp2_decode(self, x, blocks, scales, bias, token_expert_ids, lut) -> Tensor:
+    def mxfp4_moe_mlp2_decode(self, x, blocks, scales, bias, token_expert_ids, lut) -> nn.Tensor:
         """
         Implementation of the second MLP layer (Down projection) for the decode phase.
         Optimized for low-latency, single-token generation.
@@ -659,5 +656,5 @@ class MLPBlock(nn.Module):
             _func,
             "mxfp4_moe_mlp2_decode",
             args=[x, blocks, scales, bias, token_expert_ids, lut],
-            out=Tensor.placeholder([4, N], self.dtype),
+            out=nn.Tensor.placeholder([4, N], self.dtype),
         )
