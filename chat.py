@@ -7,6 +7,7 @@ from openai_harmony import (
     HarmonyEncodingName,
     Message,
     ReasoningEffort,
+    RenderConversationConfig,
     Role,
     StreamableParser,
     SystemContent,
@@ -18,11 +19,11 @@ from engine import Engine
 enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
 
-def find_common_prefix_length(cached_tokens: list[int], new_tokens: list[int]) -> int:
-    """Find the length of common prefix between cached and new tokens."""
-    min_len = min(len(cached_tokens), len(new_tokens))
+def find_lcp_index(input_tokens: list[int], tokens_history: list[int]) -> int:
+    """Find the length of common prefix between input tokens and history."""
+    min_len = min(len(input_tokens), len(tokens_history))
     for i in range(min_len):
-        if cached_tokens[i] != new_tokens[i]:
+        if input_tokens[i] != tokens_history[i]:
             return i
     return min_len
 
@@ -30,7 +31,9 @@ def find_common_prefix_length(cached_tokens: list[int], new_tokens: list[int]) -
 def get_input_tokens(messages: list[Message]) -> list[int]:
     """Get token sequence from openai-harmony."""
     conv = Conversation.from_messages(messages)
-    tokens = enc.render_conversation_for_completion(conv, Role.ASSISTANT)
+    tokens = enc.render_conversation_for_completion(
+        conv, Role.ASSISTANT, config=RenderConversationConfig(auto_drop_analysis=False)
+    )
     return tokens
 
 
@@ -54,23 +57,23 @@ def print_token_with_channel(stream: StreamableParser, current_channel: str | No
 def generate_response(
     engine: Engine,
     seq_id: int,
-    all_tokens: list[int],
-    cached_tokens: list[int],
+    new_tokens: list[int],
     max_tokens: int = 40960,
+    use_extend: bool = False,
 ) -> tuple[list[Message], list[int]]:
-    """Generate a response given input tokens. Returns (parsed messages, updated token cache)."""
     stop_token_ids = enc.stop_tokens_for_assistant_actions()
     generated_tokens = []
     stream = StreamableParser(enc, role=Role.ASSISTANT)
     current_channel: str | None = None
 
-    # Find common prefix and only prefill new tokens
-    common_len = find_common_prefix_length(cached_tokens, all_tokens)
-    new_tokens = all_tokens[common_len:]
-
     # prefill stage (only for new tokens)
+    # Use extend mode to attend to both new tokens and previously cached context
     new_tokens_array = np.array(new_tokens, dtype=np.int32)
-    prefill_logits = engine.prefill(new_tokens_array, seq_id)
+    if use_extend:
+        prefill_logits = engine.extend(new_tokens_array, seq_id)
+    else:
+        prefill_logits = engine.prefill(new_tokens_array, seq_id)
+    print(f"current seq len after prefill: {engine.get_kv_total_seq_len()}")
     sampled_token = engine.sample(prefill_logits)
     generated_tokens.append(sampled_token)
     stream.process(sampled_token)
@@ -97,10 +100,7 @@ def generate_response(
     # Signal end of stream and return parsed messages
     stream.process_eos()
 
-    # Update token cache: all input tokens + generated tokens (excluding stop token)
-    updated_cache = all_tokens + generated_tokens
-
-    return (stream.messages, updated_cache) if not is_canceled else ([], cached_tokens)
+    return (stream.messages if not is_canceled else [], generated_tokens)
 
 
 def main():
@@ -110,19 +110,19 @@ def main():
     engine = Engine(model_path, target="metal")
     print("Model loaded. Type '/exit' to quit.\n")
 
+    seq_id = engine.begin_sequence()
+
     # Initialize conversation history with system message
-    messages: list[Message] = [
+    messages = [
         Message.from_role_and_content(
             Role.SYSTEM,
             SystemContent.new()
             .with_model_identity("You are ChatGPT, a large language model trained by OpenAI.")
             .with_reasoning_effort(ReasoningEffort.LOW)
             .with_conversation_start_date(datetime.today().strftime("%Y-%m-%d")),
-        ),
+        )
     ]
-
-    seq_id = engine.begin_sequence()
-    tokens_cache: list[int] = []  # Track tokens already in KV cache
+    tokens_history: list[int] = []  # Track tokens already in KV cache
 
     while True:
         try:
@@ -139,16 +139,33 @@ def main():
             break
 
         # Add user message to history
-        messages.append(Message.from_role_and_content(Role.USER, user_input))
+        new_message = Message.from_role_and_content(Role.USER, user_input)
+        messages.append(new_message)
 
         # Get tokens for the full conversation
         all_tokens = get_input_tokens(messages)
 
-        # Generate response (only prefill tokens not already in cache)
-        response_messages, tokens_cache = generate_response(engine, seq_id, all_tokens, tokens_cache)
+        # Rewind KV cache state
+        lcp_index = find_lcp_index(all_tokens, tokens_history)
+        if lcp_index < len(tokens_history):
+            print(f"pop {len(tokens_history) - lcp_index} tokens from KV cache")
+            engine.popn(seq_id, len(tokens_history) - lcp_index)
+            tokens_history = tokens_history[:lcp_index]
+
+        new_tokens = all_tokens[lcp_index:]
+
+        # Generate response using extend mode to attend to both new tokens and cached context
+        response_messages, generated_tokens = generate_response(
+            engine,
+            seq_id,
+            new_tokens,
+            use_extend=(len(messages) > 2),  # len(messages) == 2 means it's first time prefill
+        )
 
         # Add all assistant response messages to history
         messages.extend(response_messages)
+        tokens_history.extend(new_tokens + generated_tokens)
+
         print()  # extra newline for spacing
 
 
