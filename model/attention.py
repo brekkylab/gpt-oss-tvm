@@ -6,7 +6,6 @@ from mlc_llm.nn import PagedKVCache
 from mlc_llm.support import logging
 from tvm import te, tir
 from tvm.relax.frontend import nn
-from tvm.relax.frontend.nn import Tensor, op
 
 from .config import GPTOssConfig
 
@@ -169,14 +168,14 @@ class AttentionBlock(nn.Module):
 
         return te.compute(x.shape, _rope_compute, name="yarn_rope")
 
-    def apply_rotation_to_qk(self, q: Tensor, k: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
+    def apply_rotation_to_qk(self, q: nn.Tensor, k: nn.Tensor, positions: nn.Tensor) -> tuple[nn.Tensor, nn.Tensor]:
         rope_ftn = partial(
             self._rope,
             rotary_dim=self.config.head_dim,
             theta=self.rope_theta,
         )
-        q_embed = op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
-        k_embed = op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
+        q_embed = nn.op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
+        k_embed = nn.op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
 
         return q_embed, k_embed
 
