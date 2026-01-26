@@ -106,7 +106,7 @@ class Engine:
     def clear_kv_cache(self):
         self._f_kv_cache_clear(self.paged_kv_cache)
 
-    def begin_sequence(self, sliding_window_size: int = None, sink_size: int = None):
+    def begin_sequence(self, sliding_window_size: int | None = None, sink_size: int | None = None):
         seq_id = self.__class__.next_seq_id
         self.__class__.next_seq_id += 1
         self._f_add_sequence(self.paged_kv_cache, seq_id)
