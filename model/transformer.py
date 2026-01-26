@@ -24,7 +24,7 @@ class TransformerBlock(nn.Module):
         x: nn.Tensor,
         paged_kv_cache: PagedKVCache,
         query_positions: nn.Tensor,
-        forward_to: Literal["prefill", "decode"],
+        forward_to: Literal["prefill", "decode", "extend"],
     ) -> tuple[nn.Tensor, PagedKVCache]:
         x, paged_kv_cache = self.attn(x, paged_kv_cache, query_positions, forward_to)
         x = self.mlp(x)
@@ -52,7 +52,7 @@ class Transformer(nn.Module):
         # )
 
     def forward(
-        self, x: nn.Tensor, paged_kv_cache: PagedKVCache, forward_to: Literal["prefill", "decode"]
+        self, x: nn.Tensor, paged_kv_cache: PagedKVCache, forward_to: Literal["prefill", "decode", "extend"]
     ) -> tuple[nn.Tensor, PagedKVCache]:
         query_positions = paged_kv_cache.get_query_positions(x.shape[0] * x.shape[1])
         # x = self.embedding(x)  # in embed() function
@@ -134,6 +134,22 @@ class GPTOssForCausalLM(nn.Module):
 
         return logits, paged_kv_cache
 
+    def extend(self, input_embed: nn.Tensor, paged_kv_cache: PagedKVCache) -> tuple[nn.Tensor, PagedKVCache]:
+        """Extend mode: prefill new tokens while attending to both new tokens and cached context."""
+        op_ext.configure()
+
+        def _index(x: te.Tensor):  # x[:-1,:]
+            b, s, d = x.shape  # type: ignore
+            return te.compute((b, 1, d), lambda i, _, k: x[i, s - 1, k], name="index")
+
+        seq_len = input_embed.shape[1]
+        hidden_states, paged_kv_cache = self.model(input_embed, paged_kv_cache, "extend")
+        hidden_states = nn.op.reshape(hidden_states, (1, seq_len, -1))
+        hidden_states = nn.op.tensor_expr_op(_index, name_hint="index", args=[hidden_states])
+        logits = self._get_logits(hidden_states)
+
+        return logits, paged_kv_cache
+
     def create_paged_kv_cache(  # pylint: disable=too-many-arguments
         self,
         max_batch_size: tir.Var,
@@ -184,6 +200,14 @@ class GPTOssForCausalLM(nn.Module):
             },
             "decode": {
                 "input_embed": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "extend": {
+                "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
                 "$": {
                     "param_mode": "packed",

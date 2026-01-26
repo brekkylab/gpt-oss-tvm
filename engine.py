@@ -33,6 +33,7 @@ class Engine:
         self._f_embed = self._vm["embed"]
         self._f_prefill = self._vm["prefill"]
         self._f_decode = self._vm["decode"]
+        self._f_extend = self._vm["extend"]
 
         self._f_sample = tvm.get_global_func("vm.builtin.sample_top_p_from_logits")
         self.sample_parameters = {"temperature": 0.7, "top_p": 0.9, "random_seed": 0.5}
@@ -44,6 +45,8 @@ class Engine:
         )
         self._f_begin_forward = tvm.get_global_func("vm.builtin.kv_state_begin_forward")
         self._f_end_forward = tvm.get_global_func("vm.builtin.kv_state_end_forward")
+        self._f_kv_popn = tvm.get_global_func("vm.builtin.kv_state_popn")
+        self._f_kv_get_seq_len = tvm.get_global_func("vm.builtin.attention_kv_cache_get_total_sequence_length")
 
         self.paged_kv_cache = self._create_paged_kv_cache()
         self._warmup()
@@ -118,6 +121,12 @@ class Engine:
             )
         return seq_id
 
+    def popn(self, seq_id: int, n: int):
+        self._f_kv_popn(self.paged_kv_cache, seq_id, n)
+
+    def get_kv_total_seq_len(self) -> int:
+        return self._f_kv_get_seq_len(self.paged_kv_cache)
+
     def prefill(self, input_tokens: np.ndarray, sequence_id: int = 0) -> tvm_ffi.Tensor:
         input_tokens = tvm.runtime.tensor(input_tokens, device=self.device)
         input_embed: tvm_ffi.Tensor = self._f_embed(input_tokens, self.params)
@@ -142,6 +151,21 @@ class Engine:
             tvm.runtime.ShapeTuple([1]),  # added all tokens to kv cache
         )
         logits, self.paged_kv_cache = self._f_decode(input_embed, self.paged_kv_cache, self.params)
+        self._f_end_forward(self.paged_kv_cache)
+        return logits
+
+    def extend(self, input_tokens: np.ndarray, sequence_id: int = 0) -> tvm_ffi.Tensor:
+        """Extend mode: prefill new tokens while attending to both new tokens and previously cached context."""
+        input_tokens = tvm.runtime.tensor(input_tokens, device=self.device)
+        input_embed: tvm_ffi.Tensor = self._f_embed(input_tokens, self.params)
+        input_length = input_embed.shape[1]
+
+        self._f_begin_forward(
+            self.paged_kv_cache,
+            tvm.runtime.ShapeTuple([sequence_id]),  # sequence id
+            tvm.runtime.ShapeTuple([input_length]),  # added all tokens to kv cache
+        )
+        logits, self.paged_kv_cache = self._f_extend(input_embed, self.paged_kv_cache, self.params)
         self._f_end_forward(self.paged_kv_cache)
         return logits
 
