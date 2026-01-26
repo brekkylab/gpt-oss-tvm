@@ -229,19 +229,9 @@ class AttentionBlock(nn.Module):
                 o_cross, lse_cross = paged_kv_cache.cross_attention(
                     self.layer_idx, q=q, v_head_dim=d, sm_scale=self.sm_scale
                 )
-                # Merge attention outputs weighted by their log-sum-exp values
-                # Formula: o_merged = softmax([lse_self, lse_cross]) @ [o_self, o_cross]
-                # For numerical stability, subtract max before exp
-                lse_max = op.maximum(lse_self, lse_cross)
-                exp_self = op.exp(lse_self - lse_max)
-                exp_cross = op.exp(lse_cross - lse_max)
-                exp_sum = exp_self + exp_cross
-                # Compute merged LSE: lse_max + log(exp_self + exp_cross)
-                lse_qk = lse_max + op.log(exp_sum)
-                # Compute weights for merging attention outputs (cast to match attention output dtype)
-                w_self = nn.op.astype(op.unsqueeze(exp_self / exp_sum, dim=-1), self.dtype)
-                w_cross = nn.op.astype(op.unsqueeze(exp_cross / exp_sum, dim=-1), self.dtype)
-                attention = w_self * o_self + w_cross * o_cross
+                attention, lse_qk = paged_kv_cache.merge_attn_output_inplace(
+                    o_self, lse_self, o_cross, lse_cross
+                )
             case _:
                 raise ValueError(f"forward_to {forward_to} not supported")
 
