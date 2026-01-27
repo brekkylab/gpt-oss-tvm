@@ -46,6 +46,16 @@ python run_gpt_oss.py
 python chat.py
 ```
 
+### Use other target devices
+The target device can be changed by modifying the following line in the scripts:
+```diff
+- engine = Engine(model_path, target="metal")
++ engine = Engine(model_path, target="<YOUR DEVICE TYPE>")
+```
+
+Supported device types are determined by [TVM target](https://tvm.apache.org/docs/reference/api/python/target.html) support.
+
+
 ## License
 This project follows the [Apache License 2.0](https://github.com/brekkylab/gpt-oss-tvm/blob/main/LICENSE), in line with the licenses of [gpt-oss](https://github.com/openai/gpt-oss?tab=Apache-2.0-1-ov-file#readme) and [TVM](https://github.com/apache/tvm?tab=Apache-2.0-1-ov-file#readme).
 
