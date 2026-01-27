@@ -22,8 +22,8 @@ Please refer to our [Wiki - Setup & Run](https://github.com/brekkylab/gpt-oss-tv
 ## Download model
 
 > [!NOTE]
-> The advantage of TVM lies in its support for various hardware backends, but we mainly tested with `"metal"` target on macOS.  
-> Since no other quantization is applied beyond the original mxfp4/bfloat16 weights, we recommend using an Apple Silicon Mac with 24GB or more of integrated memory.
+> While TVM supports multiple hardware backends, this project has been mainly tested with the metal target on macOS.
+> As the model uses the original mxfp4 and bfloat16 weights without further quantization, an Apple Silicon Mac with **24 GB or more of unified memory** is recommended.
 
 ### Files for gpt-oss reference torch implementation
 ```bash
