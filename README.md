@@ -20,6 +20,11 @@ To support gpt-oss _correctly_, TVM & MLC LLM needs to be built with a few patch
 Please refer to our [Wiki - Setup & Run](https://github.com/brekkylab/gpt-oss-tvm/wiki/Setup-%26-Run) page for setup instructions.
 
 ## Download model
+
+> [!NOTE]
+> The advantage of TVM lies in its support for various hardware backends, but we mainly tested with `"metal"` target on macOS.  
+> Since no other quantization is applied beyond the original mxfp4/bfloat16 weights, we recommend using an Apple Silicon Mac with 24GB or more of integrated memory.
+
 ### Files for gpt-oss reference torch implementation
 ```bash
 pip install huggingface_hub  # to use `hf` command
