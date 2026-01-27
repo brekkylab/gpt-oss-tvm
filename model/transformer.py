@@ -4,7 +4,6 @@ from mlc_llm import op as op_ext
 from mlc_llm.nn import PagedKVCache, RopeMode
 from tvm import te, tir
 from tvm.relax.frontend import nn
-from tvm.relax.frontend.nn import Tensor, op
 
 from .attention import AttentionBlock
 from .config import GPTOssConfig
@@ -97,16 +96,16 @@ class GPTOssForCausalLM(nn.Module):
         if dtype is not None:
             self.dtype = dtype
 
-    def _get_logits(self, hidden_states: Tensor) -> Tensor:
+    def _get_logits(self, hidden_states: nn.Tensor) -> nn.Tensor:
         logits = self.unembedding(hidden_states)
         if logits.dtype != "float32":
             logits = logits.astype("float32")
 
         return logits
 
-    def embed(self, input_ids: Tensor) -> Tensor:
+    def embed(self, input_ids: nn.Tensor) -> nn.Tensor:
         if self.tensor_parallel_shards > 1:
-            input_ids = op.ccl_broadcast_from_worker0(input_ids)
+            input_ids = nn.op.ccl_broadcast_from_worker0(input_ids)
         embed_ = self.model.embedding(input_ids)
 
         return nn.op.reshape(embed_, (1, -1, self.hidden_size))

@@ -69,7 +69,7 @@ def generate_response(
     # prefill stage (only for new tokens)
     # Use extend mode to attend to both new tokens and previously cached context
     new_tokens_array = np.array(new_tokens, dtype=np.int32)
-    if use_extend:
+    if use_extend:  # noqa: SIM108
         prefill_logits = engine.extend(new_tokens_array, seq_id)
     else:
         prefill_logits = engine.prefill(new_tokens_array, seq_id)
@@ -163,7 +163,8 @@ def main():
         )
 
         # Add all assistant response messages to history
-        messages.extend(response_messages)
+        # temporarily, exclude used 'analysis' reasoning manually
+        messages.extend([message for message in response_messages if message.channel != "analysis"])
         tokens_history.extend(new_tokens + generated_tokens)
 
         print()  # extra newline for spacing

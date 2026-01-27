@@ -6,7 +6,6 @@ from mlc_llm.nn import PagedKVCache
 from mlc_llm.support import logging
 from tvm import te, tir
 from tvm.relax.frontend import nn
-from tvm.relax.frontend.nn import Tensor, op
 
 from .config import GPTOssConfig
 
@@ -169,14 +168,14 @@ class AttentionBlock(nn.Module):
 
         return te.compute(x.shape, _rope_compute, name="yarn_rope")
 
-    def apply_rotation_to_qk(self, q: Tensor, k: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
+    def apply_rotation_to_qk(self, q: nn.Tensor, k: nn.Tensor, positions: nn.Tensor) -> tuple[nn.Tensor, nn.Tensor]:
         rope_ftn = partial(
             self._rope,
             rotary_dim=self.config.head_dim,
             theta=self.rope_theta,
         )
-        q_embed = op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
-        k_embed = op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
+        q_embed = nn.op.tensor_expr_op(rope_ftn, "rope_q", [q, positions])
+        k_embed = nn.op.tensor_expr_op(rope_ftn, "rope_k", [k, positions])
 
         return q_embed, k_embed
 
@@ -229,19 +228,9 @@ class AttentionBlock(nn.Module):
                 o_cross, lse_cross = paged_kv_cache.cross_attention(
                     self.layer_idx, q=q, v_head_dim=d, sm_scale=self.sm_scale
                 )
-                # Merge attention outputs weighted by their log-sum-exp values
-                # Formula: o_merged = softmax([lse_self, lse_cross]) @ [o_self, o_cross]
-                # For numerical stability, subtract max before exp
-                lse_max = op.maximum(lse_self, lse_cross)
-                exp_self = op.exp(lse_self - lse_max)
-                exp_cross = op.exp(lse_cross - lse_max)
-                exp_sum = exp_self + exp_cross
-                # Compute merged LSE: lse_max + log(exp_self + exp_cross)
-                lse_qk = lse_max + op.log(exp_sum)
-                # Compute weights for merging attention outputs (cast to match attention output dtype)
-                w_self = nn.op.astype(op.unsqueeze(exp_self / exp_sum, dim=-1), self.dtype)
-                w_cross = nn.op.astype(op.unsqueeze(exp_cross / exp_sum, dim=-1), self.dtype)
-                attention = w_self * o_self + w_cross * o_cross
+                attention, lse_qk = paged_kv_cache.merge_attn_output_inplace(
+                    o_self, lse_self, o_cross, lse_cross
+                )
             case _:
                 raise ValueError(f"forward_to {forward_to} not supported")
 
