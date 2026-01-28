@@ -54,7 +54,8 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
         assert self.num_attention_heads % self.num_key_value_heads == 0
 
         if self.context_window_size == 0:
-            for name in ["max_position_embeddings", "max_sequence_length"]:
+            # used for-else clause
+            for name in ["max_position_embeddings", "max_sequence_length", "initial_context_length"]:
                 if name in self.kwargs:
                     self.context_window_size = self.kwargs.pop(name)
                     logger.info(
@@ -64,14 +65,14 @@ class GPTOssConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
                         self.context_window_size,
                     )
                     break
-        else:
-            # model originally supports 131_072(128k), but default value is capped to 40k.
-            self.context_window_size = 40960
-            logger.info(
-                "Unable to determine the maximum sequence length, because none of "
-                "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
-                "provided in `config.json`. So it is set to the default value %d.",
-                self.context_window_size,
-            )
+            else: # fallback if none of the above keys exist
+                # model originally supports 131_072(128k), but default value is capped to 40k.
+                self.context_window_size = 40960
+                logger.info(
+                    "Unable to determine the maximum sequence length, because none of "
+                    "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
+                    "provided in `config.json`. So it is set to the default value %d.",
+                    self.context_window_size,
+                )
 
         self.prefill_chunk_size = min(self.context_window_size, self.prefill_chunk_size)
