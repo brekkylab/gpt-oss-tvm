@@ -1,5 +1,7 @@
 from math import prod
+import numpy as np
 
+from mlc_llm.op.moe_misc import gating_softmax_topk
 from tvm import relax
 from tvm.relax.frontend import nn
 from tvm.script import tir as T
@@ -149,7 +151,11 @@ class MLPBlock(nn.Module):
         scales: nn.Tensor,
         rows_per_chunk: int | None = None,  # unused, kept for compatibility
     ) -> nn.Tensor:
-        import numpy as np
+        """
+        remain to compare dequantize logics;
+        instead of using this function directly,
+        we dequantize MXFP4 in `run_einsum()` function
+        """
 
         if rows_per_chunk is None:
             rows_per_chunk = 16384 * 512
@@ -244,12 +250,9 @@ class MLPBlock(nn.Module):
         bias_tensor: nn.Tensor,
         safetensor_dtype: str | None = None,
     ) -> nn.Tensor:
-        """Fused einsum with on-the-fly MXFP4 dequantization.
-
-        Uses single in_idx loop like original run_einsum.
-        Computes group_idx, byte_idx, nibble from in_idx.
         """
-        import numpy as np
+        Fused einsum with on-the-fly MXFP4 dequantization.
+        """
 
         einsum_dtype = "float32"
         safetensor_dtype = self.dtype
@@ -378,8 +381,9 @@ class MLPBlock(nn.Module):
         # here, type: (Tensor, Tensor)
         # top_k is 4
         # expert_indices: (seq_len, top_k)
-        expert_weights, expert_indices = nn.op.topk(g, k=self.experts_per_token, axis=-1, largest=True)
-        expert_weights = nn.op.softmax(expert_weights, axis=1)
+        # expert_weights, expert_indices = nn.op.topk(g, k=self.experts_per_token, axis=-1, largest=True)
+        # expert_weights = nn.op.softmax(expert_weights, axis=1)
+        expert_weights, expert_indices = gating_softmax_topk(g, k=self.experts_per_token)
 
         # MLP #1
         # self.mlp1_weight: (32, 5760, 2880)
